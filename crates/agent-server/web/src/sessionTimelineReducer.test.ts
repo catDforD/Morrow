@@ -83,6 +83,7 @@ function event(sequence: number, update: SessionUpdate): SessionStreamFrame {
 describe('session timeline reducer', () => {
   it('projects live reasoning, intermediate commentary and complete tool details without duplicating the final answer', () => {
     const value = snapshot()
+    value.session.turns[0].model.model_name = 'Selected model'
     const call = { id: 'read-1', type: 'function' as const, function: { name: 'read_file', arguments: '{"path":"App.tsx"}' } }
     value.session.turns[0].steps = [
       { id: 'model-call-1', kind: 'model_call', status: 'running' },
@@ -92,6 +93,8 @@ describe('session timeline reducer', () => {
     ]
     const item = timelineFromSnapshot(value).find((item) => item.kind === 'run')
     if (item?.kind !== 'run') throw new Error('Missing execution trace')
+    expect(item.trace.steps.filter((step) => step.kind === 'model').map((step) => step.title))
+      .toEqual(['Selected model', 'Selected model', 'Selected model'])
     expect(item.trace.steps[0].reasoning).toBe('thinking')
     expect(item.trace.steps[1].commentary).toBe('先查看入口。')
     expect(item.trace.steps[2]).toMatchObject({ toolCall: call, output: 'not found', status: 'error' })

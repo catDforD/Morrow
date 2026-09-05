@@ -124,17 +124,17 @@ impl RuntimeSubagentExecutor {
         cancellation: CancellationToken,
     ) -> SubagentExecutionSummary {
         let allowed = BuiltInToolAllowlist::research().filtered(&self.tools);
-        let tools = match ToolRegistry::built_in_with_allowlist_and_writer_lease_and_artifact_root(
-            self.workspace_root.as_ref(),
-            PermissionProfile {
-                mode: PermissionMode::ReadOnly,
-                shell: ShellPolicy::Deny,
-            },
+        let tools = match ToolRegistry::from_options(ToolRegistryOptions {
             allowed,
-            None,
-            self.artifact_root.as_deref().cloned(),
-            true,
-        ) {
+            artifact_root: self.artifact_root.as_deref().cloned(),
+            ..ToolRegistryOptions::new(
+                self.workspace_root.as_ref(),
+                PermissionProfile {
+                    mode: PermissionMode::ReadOnly,
+                    shell: ShellPolicy::Deny,
+                },
+            )
+        }) {
             Ok(tools) => tools,
             Err(error) => {
                 return SubagentExecutionSummary::failure(task, error.to_string(), 0, 0);

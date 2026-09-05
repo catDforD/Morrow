@@ -127,6 +127,30 @@ pub struct ToolRegistryBuild {
     pub diagnostics: Vec<String>,
 }
 
+/// Shared options for built-in and MCP tool assembly.
+#[derive(Debug, Clone)]
+pub struct ToolRegistryOptions {
+    pub root: PathBuf,
+    pub permissions: PermissionProfile,
+    pub allowed: BuiltInToolAllowlist,
+    pub writer_lease: Option<Arc<Semaphore>>,
+    pub artifact_root: Option<PathBuf>,
+    pub auto_approve_workspace_writes: bool,
+}
+
+impl ToolRegistryOptions {
+    pub fn new(root: impl Into<PathBuf>, permissions: PermissionProfile) -> Self {
+        Self {
+            root: root.into(),
+            permissions,
+            allowed: BuiltInToolAllowlist::all(),
+            writer_lease: None,
+            artifact_root: None,
+            auto_approve_workspace_writes: true,
+        }
+    }
+}
+
 impl std::fmt::Debug for ToolRegistry {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let tools = self
@@ -150,7 +174,7 @@ impl ToolRegistry {
         root: impl Into<PathBuf>,
         permissions: PermissionProfile,
     ) -> Result<Self, ToolRegistryError> {
-        Self::built_in_with_allowlist(root, permissions, BuiltInToolAllowlist::all())
+        Self::from_options(ToolRegistryOptions::new(root, permissions))
     }
 
     pub fn built_in_with_allowlist(
@@ -158,7 +182,10 @@ impl ToolRegistry {
         permissions: PermissionProfile,
         allowed: BuiltInToolAllowlist,
     ) -> Result<Self, ToolRegistryError> {
-        Self::built_in_with_allowlist_and_writer_lease(root, permissions, allowed, None)
+        Self::from_options(ToolRegistryOptions {
+            allowed,
+            ..ToolRegistryOptions::new(root, permissions)
+        })
     }
 
     pub fn built_in_with_allowlist_and_writer_lease(
@@ -167,14 +194,11 @@ impl ToolRegistry {
         allowed: BuiltInToolAllowlist,
         writer_lease: Option<Arc<Semaphore>>,
     ) -> Result<Self, ToolRegistryError> {
-        Self::built_in_with_allowlist_and_writer_lease_and_artifact_root(
-            root,
-            permissions,
+        Self::from_options(ToolRegistryOptions {
             allowed,
             writer_lease,
-            None,
-            true,
-        )
+            ..ToolRegistryOptions::new(root, permissions)
+        })
     }
 
     pub fn built_in_with_allowlist_and_writer_lease_and_artifact_root(
@@ -185,6 +209,25 @@ impl ToolRegistry {
         artifact_root: Option<PathBuf>,
         auto_approve_workspace_writes: bool,
     ) -> Result<Self, ToolRegistryError> {
+        Self::from_options(ToolRegistryOptions {
+            root: root.into(),
+            permissions,
+            allowed,
+            writer_lease,
+            artifact_root,
+            auto_approve_workspace_writes,
+        })
+    }
+
+    pub fn from_options(options: ToolRegistryOptions) -> Result<Self, ToolRegistryError> {
+        let ToolRegistryOptions {
+            root,
+            permissions,
+            allowed,
+            writer_lease,
+            artifact_root,
+            auto_approve_workspace_writes,
+        } = options;
         let evaluator = PermissionEvaluator::new_with_read_roots(
             root,
             permissions,
@@ -213,17 +256,17 @@ impl ToolRegistry {
         root: impl Into<PathBuf>,
         artifact_root: Option<PathBuf>,
     ) -> Result<Self, ToolRegistryError> {
-        Self::built_in_with_allowlist_and_writer_lease_and_artifact_root(
-            root,
-            PermissionProfile {
-                mode: PermissionMode::ReadOnly,
-                shell: ShellPolicy::Deny,
-            },
-            BuiltInToolAllowlist::research(),
-            None,
+        Self::from_options(ToolRegistryOptions {
+            allowed: BuiltInToolAllowlist::research(),
             artifact_root,
-            true,
-        )
+            ..ToolRegistryOptions::new(
+                root,
+                PermissionProfile {
+                    mode: PermissionMode::ReadOnly,
+                    shell: ShellPolicy::Deny,
+                },
+            )
+        })
     }
 
     pub async fn with_mcp_cache_async(
@@ -232,8 +275,13 @@ impl ToolRegistry {
         mcp_servers: &[McpServerConfig],
         mcp_cache: &McpToolCache,
     ) -> Result<ToolRegistryBuild, ToolRegistryError> {
-        Self::with_mcp_cache_and_writer_lease_async(root, permissions, mcp_servers, mcp_cache, None)
-            .await
+        Self::with_mcp_options(
+            ToolRegistryOptions::new(root, permissions),
+            mcp_servers,
+            mcp_cache,
+            &ToolsConfig::default(),
+        )
+        .await
     }
 
     pub async fn with_mcp_cache_and_writer_lease_async(
@@ -243,13 +291,14 @@ impl ToolRegistry {
         mcp_cache: &McpToolCache,
         writer_lease: Option<Arc<Semaphore>>,
     ) -> Result<ToolRegistryBuild, ToolRegistryError> {
-        Self::with_mcp_cache_and_writer_lease_and_artifact_root_async(
-            root,
-            permissions,
+        Self::with_mcp_options(
+            ToolRegistryOptions {
+                writer_lease,
+                ..ToolRegistryOptions::new(root, permissions)
+            },
             mcp_servers,
             mcp_cache,
-            writer_lease,
-            None,
+            &ToolsConfig::default(),
         )
         .await
     }
@@ -262,20 +311,20 @@ impl ToolRegistry {
         writer_lease: Option<Arc<Semaphore>>,
         artifact_root: Option<PathBuf>,
     ) -> Result<ToolRegistryBuild, ToolRegistryError> {
-        Self::with_mcp_cache_and_writer_lease_and_artifact_root_and_tool_filter_async(
-            root,
-            permissions,
+        Self::with_mcp_options(
+            ToolRegistryOptions {
+                writer_lease,
+                artifact_root,
+                ..ToolRegistryOptions::new(root, permissions)
+            },
             mcp_servers,
             mcp_cache,
-            writer_lease,
-            artifact_root,
             &ToolsConfig::default(),
-            true,
         )
         .await
     }
 
-    // 逐级透传的装配参数本就偏多，引入 options 结构体重构留给后续统一处理。
+    // Compatibility entry point; new callers use with_mcp_options.
     #[allow(clippy::too_many_arguments)]
     pub async fn with_mcp_cache_and_writer_lease_and_artifact_root_and_tool_filter_async(
         root: impl Into<PathBuf>,
@@ -287,15 +336,29 @@ impl ToolRegistry {
         tools: &ToolsConfig,
         auto_approve_workspace_writes: bool,
     ) -> Result<ToolRegistryBuild, ToolRegistryError> {
-        let root = root.into();
-        let mut registry = Self::built_in_with_allowlist_and_writer_lease_and_artifact_root(
-            &root,
-            permissions,
-            BuiltInToolAllowlist::all().filtered(tools),
-            writer_lease,
-            artifact_root,
-            auto_approve_workspace_writes,
-        )?;
+        Self::with_mcp_options(
+            ToolRegistryOptions {
+                writer_lease,
+                artifact_root,
+                auto_approve_workspace_writes,
+                ..ToolRegistryOptions::new(root, permissions)
+            },
+            mcp_servers,
+            mcp_cache,
+            tools,
+        )
+        .await
+    }
+
+    pub async fn with_mcp_options(
+        mut options: ToolRegistryOptions,
+        mcp_servers: &[McpServerConfig],
+        mcp_cache: &McpToolCache,
+        tools: &ToolsConfig,
+    ) -> Result<ToolRegistryBuild, ToolRegistryError> {
+        options.allowed = options.allowed.filtered(tools);
+        let root = options.root.clone();
+        let mut registry = Self::from_options(options)?;
         let discovery = mcp::discover_tools_with_filter(&root, mcp_servers, mcp_cache, tools).await;
         for tool in discovery.tools {
             registry.register(tool)?;

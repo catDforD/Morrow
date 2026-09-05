@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "updated_at_ms": 1787581873607,
+  "updated_at_ms": 1788613940416,
   "budgets": {
     "after_turn_continue_reruns_model": {
       "max_model_calls": 2,
@@ -51,6 +51,11 @@
       "max_model_calls": 1,
       "max_tool_calls": 0,
       "max_estimated_tokens": 30
+    },
+    "model_messages_survive_tools_and_continuation": {
+      "max_model_calls": 3,
+      "max_tool_calls": 1,
+      "max_estimated_tokens": 415
     },
     "reads_two_files_in_order": {
       "max_model_calls": 2,

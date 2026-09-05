@@ -299,23 +299,40 @@ impl AgentTurnStream<'_> {
     }
 
     fn complete_turn(&mut self) {
-        let assistant_text = self.assistant_text.clone();
-        let assistant_message = Message::assistant(assistant_text.clone())
-            .with_reasoning_content(self.assistant_reasoning.clone());
-        self.turn_messages.push(assistant_message.clone());
-        self.turn.complete(assistant_message);
-        self.pending.push_back(AgentEvent::ModelMessageCommitted {
-            model_call_id: format!("model-call-{}", self.model_call_index),
-            message: self
-                .turn
-                .assistant_message
-                .clone()
-                .expect("completed turn has assistant message"),
-        });
+        let assistant_message = self.take_assistant_message(None);
+        let assistant_text = assistant_message.content.clone().unwrap_or_default();
+        self.turn.complete(assistant_message.clone());
+        self.record_model_message(assistant_message);
         self.pending
             .push_back(AgentEvent::AgentMessage(assistant_text));
         self.pending.push_back(AgentEvent::TurnCompleted);
         self.finished = true;
+    }
+
+    fn take_assistant_message(&mut self, tool_calls: Option<Vec<ToolCall>>) -> Message {
+        let text = std::mem::take(&mut self.assistant_text);
+        let message = match tool_calls {
+            Some(calls) if text.is_empty() => Message::assistant_tool_calls(calls),
+            Some(calls) => Message::assistant_tool_calls_with_content(text, calls),
+            None => Message::assistant(text),
+        };
+        message.with_reasoning_content(std::mem::take(&mut self.assistant_reasoning))
+    }
+
+    fn record_model_message(&mut self, message: Message) {
+        self.turn_messages.push(message.clone());
+        self.pending.push_back(AgentEvent::ModelMessageCommitted {
+            model_call_id: format!("model-call-{}", self.model_call_index),
+            message,
+        });
+    }
+
+    fn continue_with_model_message(&mut self, message: Message) {
+        if let Some(step) = self.turn.steps.last_mut() {
+            step.complete();
+        }
+        self.conversation.push(message.clone());
+        self.record_model_message(message);
     }
 
     fn fail_turn(&mut self, error: impl ToString) {
@@ -378,18 +395,8 @@ impl AgentTurnStream<'_> {
             return;
         }
         self.after_turn_continues += 1;
-        // 与 complete_turn 前半相同：提交当前 assistant message，但 turn 继续运行。
-        if let Some(step) = self.turn.steps.last_mut() {
-            step.complete();
-        }
-        let assistant_message = Message::assistant(std::mem::take(&mut self.assistant_text))
-            .with_reasoning_content(std::mem::take(&mut self.assistant_reasoning));
-        self.conversation.push(assistant_message.clone());
-        self.turn_messages.push(assistant_message.clone());
-        self.pending.push_back(AgentEvent::ModelMessageCommitted {
-            model_call_id: format!("model-call-{}", self.model_call_index),
-            message: assistant_message,
-        });
+        let assistant_message = self.take_assistant_message(None);
+        self.continue_with_model_message(assistant_message);
         append_middleware_context_message(&mut self.conversation, &run.context);
         self.start_next_model_call();
     }
@@ -431,27 +438,9 @@ impl AgentTurnStream<'_> {
             }
         }
 
-        if let Some(step) = self.turn.steps.last_mut() {
-            step.complete();
-        }
         self.tool_rounds += 1;
-        let assistant_message = if self.assistant_text.is_empty() {
-            Message::assistant_tool_calls(tool_calls.clone())
-        } else {
-            Message::assistant_tool_calls_with_content(
-                self.assistant_text.clone(),
-                tool_calls.clone(),
-            )
-        }
-        .with_reasoning_content(self.assistant_reasoning.clone());
-        self.assistant_reasoning.clear();
-        self.assistant_text.clear();
-        self.conversation.push(assistant_message.clone());
-        self.turn_messages.push(assistant_message.clone());
-        self.pending.push_back(AgentEvent::ModelMessageCommitted {
-            model_call_id: format!("model-call-{}", self.model_call_index),
-            message: assistant_message,
-        });
+        let assistant_message = self.take_assistant_message(Some(tool_calls.clone()));
+        self.continue_with_model_message(assistant_message);
         self.pending_tool_calls = tool_calls.into_iter().enumerate().collect();
         self.pending_tool_results.clear();
         self.pending_middleware_context.clear();

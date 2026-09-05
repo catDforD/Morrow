@@ -19,7 +19,7 @@ use agent_protocol::{
 };
 use agent_tools::{
     BuiltInToolAllowlist, CancellationToken, MAX_SUBAGENT_TASK_CHARS, SubagentController,
-    ToolRegistry, effective_subagent_permissions,
+    ToolRegistry, ToolRegistryOptions, effective_subagent_permissions,
 };
 use futures_util::StreamExt;
 use futures_util::future::{BoxFuture, FutureExt};
@@ -797,16 +797,15 @@ impl SubagentSupervisor {
                 .filtered(&self.inner.tools);
         let writer_lease = (document.snapshot.role == SubagentRole::Reviewer)
             .then(|| self.inner.writer_slot.clone());
-        let tools = ToolRegistry::built_in_with_allowlist_and_writer_lease_and_artifact_root(
-            &self.inner.workspace_root,
-            document.permission_ceiling,
+        let tools = ToolRegistry::from_options(ToolRegistryOptions {
             allowed,
             writer_lease,
-            self.inner.artifact_root.clone(),
+            artifact_root: self.inner.artifact_root.clone(),
             // 持久化子代理无人值守运行，审批只会被 auto-deny；边界由
             // permission_ceiling 与角色 allowlist 承担，workspace 内写直接放行。
-            true,
-        )?;
+            auto_approve_workspace_writes: true,
+            ..ToolRegistryOptions::new(&self.inner.workspace_root, document.permission_ceiling)
+        })?;
         let fact_store = self.inner.store.fact_store(&instance_id)?;
         if !fact_store.path().is_file() {
             fact_store.save(&document.session)?;

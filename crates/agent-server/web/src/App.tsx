@@ -2795,28 +2795,6 @@ function modelSelectionLabel(
   return `${selected.provider.name} · ${selected.model.name} · ${reasoningLabel(selection.reasoning)}`
 }
 
-export function completeRunningModelStep(trace: RunTrace): RunTrace {
-  let changed = false
-  const steps = trace.steps.map((step) => {
-    if (step.kind !== 'model' || step.status !== 'running') return step
-    changed = true
-    return { ...step, status: 'ok' as const }
-  })
-  return changed ? { ...trace, steps } : trace
-}
-
-export function modelStepPresentation(
-  settings: ModelSettingsResponse | null,
-  selection: ModelSelection | null,
-): { title: string; detail?: string } {
-  const selected = findSelectedModel(settings, selection)
-  if (!selected || !selection) return { title: 'Model call' }
-  return {
-    title: selected.model.name,
-    detail: `${selected.provider.name} · ${reasoningLabel(selection.reasoning)}`,
-  }
-}
-
 export function shouldSubmitPromptOnEnter(
   key: string,
   ctrlKey: boolean,
