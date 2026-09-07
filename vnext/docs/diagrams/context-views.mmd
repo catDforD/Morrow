@@ -1,0 +1,17 @@
+flowchart TB
+  Fact["新 Fact"] --> Validate["Projection.validate<br/>检查状态与消息链约束"]
+  Validate --> Log[("JSONL · 完整事实历史<br/>write_all + sync_data")]
+  Log --> Live["apply_validated<br/>实时更新"]
+  Log --> Replay["打开会话：校验哈希与顺序<br/>按相同 reducer 回放"]
+  Live --> P["Projection · 当前状态"]
+  Replay --> P
+  P --> Nodes["nodes<br/>旧消息与摘要节点均保留"]
+  P --> Surface["surface<br/>当前模型上下文的有序节点 ID"]
+  P --> State["run / effects / approvals<br/>plugins / bindings / plugin_state"]
+  Nodes --> Resolve["按请求中的节点 ID 取消息"]
+  Surface --> Prepared["PreparedRequest<br/>保存此次 surface、header、temporary、registrations"]
+  Prepared --> Resolve
+  Resolve --> Body["重建模型请求 body<br/>可与保存的 body 比较"]
+  Log --> Chat["Web 聊天历史 / 事实时间线"]
+  Surface -.-> Compact["surface_replaced<br/>以摘要替换连续区间，增加 revision"]
+  Compact -.-> Fact

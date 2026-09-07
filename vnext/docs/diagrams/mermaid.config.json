@@ -1,0 +1,16 @@
+{
+  "theme": "neutral",
+  "fontFamily": "Arial, Noto Sans CJK SC, sans-serif",
+  "flowchart": {
+    "useMaxWidth": true,
+    "htmlLabels": false,
+    "curve": "linear"
+  },
+  "sequence": {
+    "useMaxWidth": true,
+    "wrap": true,
+    "width": 130,
+    "actorMargin": 30,
+    "messageMargin": 30
+  }
+}

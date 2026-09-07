@@ -1,0 +1,14 @@
+flowchart TB
+  Source["编写 Host / Client<br/>开发时打包依赖"] --> Define["define<br/>保存源码与 manifest<br/>计算版本 hash"]
+  Define --> Review["用户审阅并 trust<br/>记录具体版本的信任"]
+  Review --> Bind["activate / promote<br/>持久化有效绑定"]
+  Bind --> Host["Host 同步<br/>导入 ESM，创建 Cordis Fiber"]
+  Bind --> Browser["Client 显式加载<br/>导入 ESM，注册 Web 组件"]
+  Host --> Contributions["tool / model / policy / method<br/>Driver 固定到当前 Run 结束"]
+  Browser --> Views["panel / page / renderer"]
+  Contributions --> Stop["stop 或版本切换<br/>按生命周期边界清理 Fiber"]
+  Views --> Stop
+  Stop --> Kept["保留历史事实与插件状态<br/>重新激活可恢复同一版本"]
+  Kept --> Bind
+  Define -.-> New["修改 manifest 产生新 hash<br/>重新审阅和信任"]
+  New --> Review

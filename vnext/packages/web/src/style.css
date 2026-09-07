@@ -1,0 +1,22 @@
+/* vNext additions. The workspace appearance is ported unchanged in styles.css. */
+.app-status { position: fixed; z-index: 80; top: 12px; left: 50%; transform: translateX(-50%); width: min(760px, calc(100% - 24px)); }
+.permission-indicator { cursor: default; }
+.vnext-drawer-tabs { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.extension-stack { display: grid; gap: 18px; }
+.extension-card, .extension-form { padding: 20px; }
+.extension-form { display: grid; gap: 20px; }
+.extension-card h2, .extension-card h3 { margin: 0 0 10px; font-size: 15px; font-weight: 500; overflow-wrap: anywhere; }
+.extension-card p { margin: 8px 0; font-size: 13px; color: var(--muted); }
+.extension-hash { display: block; overflow-wrap: anywhere; font-size: 11px; color: var(--muted); }
+.extension-source { margin: 18px 0; }
+.extension-source h3 { margin-top: 18px; }
+.extension-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; font-size: 12px; }
+.extension-field { display: grid; gap: 8px; font-size: 12px; }
+.extension-field textarea { width: 100%; min-height: 100px; resize: vertical; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-panel); color: var(--foreground); padding: 10px; font: inherit; line-height: 1.6; }
+.extension-card > .extension-field { margin: 16px 0; }
+.extension-source pre, .fact-record pre { max-width: 100%; max-height: 420px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; margin: 12px 0; border-radius: var(--radius); background: var(--surface-code); font: 12px/1.6 var(--font-mono); }
+.extension-card summary, .extension-form summary, .fact-record summary { cursor: pointer; font-size: 12px; overflow-wrap: anywhere; }
+.fact-record { min-width: 0; border-bottom: 1px solid var(--border); padding-bottom: 12px; }
+.conversation-notice { margin: 18px 0; }
+.approval-reason { display: flex; align-items: center; gap: 8px; }
+.approval-body { overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }

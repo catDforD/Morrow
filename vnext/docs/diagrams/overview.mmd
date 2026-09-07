@@ -1,0 +1,34 @@
+flowchart TB
+  subgraph Browser["浏览器 · React"]
+    Web["Web 外壳<br/>会话、聊天、审批、设置"]
+    Client["Client 插件<br/>面板、页面、消息 renderer"]
+    Web --- Client
+  end
+  subgraph Rust["Rust 进程 · morrow-next"]
+    Server["server.rs<br/>HTTP API / events WebSocket"]
+    Runtime["runtime.rs<br/>输入队列 / Run 编排 / 插件绑定 / 子会话"]
+    Effects["effects.rs<br/>模型与工具执行 / 审批"]
+    Store["store.rs + projection.rs<br/>事实落盘 / 状态校验与投影"]
+    RPC["rpc.rs<br/>双向 JSON-RPC / Host epoch"]
+    Server --> Runtime
+    Runtime --> Store
+    Runtime --> Effects
+    Effects --> Store
+    Runtime <--> RPC
+    Effects <--> RPC
+  end
+  subgraph Node["Node 24 进程 · Host"]
+    Loader["loader.ts + Cordis<br/>每个 Session 的 Context / Fiber"]
+    Plugins["默认与自定义插件<br/>driver / policy / model / tool / method"]
+    SDK["SDK · RunContext<br/>步骤、模型、工具、上下文、插件状态"]
+    Loader --> Plugins
+    Plugins --> SDK
+  end
+  Web -->|"HTTP 操作 / 查询"| Server
+  Server -->|"已提交事实通知 / 临时文本 delta"| Web
+  Client -->|"invoke 公开方法"| Server
+  RPC <-->|"WebSocket /host"| SDK
+  RPC <-->|"driver.run / registration.invoke / client.invoke"| Loader
+  Store --> Disk[("本地 JSONL 与插件版本文件")]
+  Effects --> Native["外部执行目标<br/>模型 API / 工作区文件 / Shell 子进程"]
+  Plugins -.-> External["MCP / 自定义 Provider / 外部服务"]

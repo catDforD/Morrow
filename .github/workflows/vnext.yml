@@ -1,0 +1,29 @@
+name: vNext
+on:
+  pull_request:
+    paths: ['vnext/**', '.github/workflows/vnext.yml']
+  push:
+    paths: ['vnext/**', '.github/workflows/vnext.yml']
+  workflow_dispatch:
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.3
+      - run: pnpm install --frozen-lockfile
+        working-directory: vnext
+      - run: cargo fmt --check && cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo build --bin morrow-next
+        working-directory: vnext
+      - run: pnpm check:types && pnpm build && pnpm typecheck && pnpm test && pnpm eval
+        working-directory: vnext
+      - run: pnpm exec playwright install --with-deps chromium && pnpm test:browser
+        working-directory: vnext
