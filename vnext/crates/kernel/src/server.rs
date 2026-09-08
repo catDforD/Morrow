@@ -106,24 +106,7 @@ async fn events(
 
 async fn sessions(State(state): State<ServerState>, headers: HeaderMap) -> ApiResult {
     auth(&headers, &state)?;
-    let directory = state.runtime.home.join("sessions");
-    let mut sessions = vec![];
-    if directory.exists() {
-        for entry in std::fs::read_dir(directory).map_err(anyhow::Error::from)? {
-            let entry = entry.map_err(anyhow::Error::from)?;
-            if entry.path().extension().is_some_and(|e| e == "jsonl") {
-                sessions.push(
-                    entry
-                        .path()
-                        .file_stem()
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned(),
-                );
-            }
-        }
-    }
-    sessions.sort();
+    let sessions = crate::sessions::names(&state.runtime.home, &state.runtime.workspace)?;
     Ok(Json(json!(sessions)))
 }
 
@@ -151,7 +134,7 @@ async fn facts(
             .store
             .lock()
             .await
-            .records
+            .facts()?
     )))
 }
 async fn request(
@@ -160,14 +143,8 @@ async fn request(
     headers: HeaderMap,
 ) -> ApiResult {
     auth(&headers, &state)?;
-    let projection = state.runtime.snapshot(&session).await?;
-    let prepared = projection
-        .requests
-        .get(&request)
-        .ok_or_else(|| anyhow::anyhow!("unknown request"))?;
-    Ok(Json(
-        json!({"prepared":prepared,"reconstructed":projection.reconstruct(prepared)?}),
-    ))
+    let session = state.runtime.session(&session).await?;
+    Ok(Json(session.store.lock().await.audit(&request)?))
 }
 
 async fn client(
@@ -220,6 +197,8 @@ async fn action(
     let runtime = &state.runtime;
     let action = string(&params, "action")?;
     let result = match action {
+        "migrate" => runtime.migrate(&session,string(&params,"target")?).await?,
+        "profiles" => runtime.host().await?.call("profiles.list",json!({})).await?,
         "resume" => runtime.host().await?.call("session.resume",json!({"session":session})).await?,
         "submit" => { require(session != "_workspace", "reserved session")?; runtime.submit(&session,string(&params,"submission")?,string(&params,"text")?).await? }
         "cancel" => { runtime.cancel(&session).await?; Value::Null }

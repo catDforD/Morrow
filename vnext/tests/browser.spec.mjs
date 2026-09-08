@@ -58,7 +58,8 @@ test('model-defined dual plugin: review, trust, tools, panel, stop, reconnect, r
     await page.getByRole('button', { name: '事实时间线', exact: true }).click()
     await page.getByText(/request_prepared/).first().click()
     await page.getByRole('button', { name: '重建模型请求', exact: true }).first().click()
-    await expect(page.getByTestId('reconstructed-request')).toContainText('reconstructed')
+    await expect(page.getByTestId('reconstructed-request')).toContainText('"input"')
+    await expect(page.getByTestId('reconstructed-request')).toContainText('"plan"')
   } finally { await server.stop(); await env.dispose() }
 })
 

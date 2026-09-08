@@ -28,6 +28,7 @@ pub struct SessionStore {
     file: File,
     pub projection: Projection,
     pub records: Vec<Record>,
+    pub legacy: Option<crate::legacy::LegacyLog>,
     poisoned: bool,
 }
 
@@ -44,6 +45,29 @@ impl SessionStore {
             .context("session is already open in another process")?;
         let mut bytes = vec![];
         file.read_to_end(&mut bytes)?;
+        if bytes
+            .split(|b| *b == b'\n')
+            .find(|b| !b.is_empty())
+            .is_some_and(|line| {
+                serde_json::from_slice::<serde_json::Value>(line)
+                    .ok()
+                    .is_some_and(|v| v["protocol"] == 1)
+            })
+        {
+            let legacy = crate::legacy::LegacyLog::read(&bytes)?;
+            let projection = legacy.normalized()?;
+            ensure!(
+                Path::new(&projection.workspace) == workspace.canonicalize()?,
+                "session belongs to a different workspace"
+            );
+            return Ok(Self {
+                file,
+                projection,
+                records: vec![],
+                legacy: Some(legacy),
+                poisoned: false,
+            });
+        }
         // Only an unterminated final record can be torn. Preserve it before truncating.
         if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
             let end = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
@@ -62,6 +86,7 @@ impl SessionStore {
             file,
             projection: Projection::default(),
             records: vec![],
+            legacy: None,
             poisoned: false,
         };
         for (line, bytes) in bytes
@@ -103,6 +128,10 @@ impl SessionStore {
     }
 
     pub fn commit(&mut self, fact: Fact) -> Result<Record> {
+        ensure!(
+            self.legacy.is_none(),
+            "v1 session is read-only; use session migrate to copy it to v2"
+        );
         ensure!(
             !self.poisoned,
             "fact writer unavailable after persistence failure; reopen session"
@@ -168,11 +197,11 @@ impl SessionStore {
         for request in requests {
             if let Some(effect) = self.projection.effects.get(&request)
                 && effect.outcome == Some(Outcome::Completed)
-                && let Ok(message) = serde_json::from_value::<Message>(effect.output.clone())
+                && let Ok(result) = serde_json::from_value::<ModelResult>(effect.output.clone())
             {
                 self.commit(Fact::ModelSettled {
                     request,
-                    message: Some(message),
+                    result: Some(result),
                     error: None,
                 })?;
                 continue;
@@ -184,8 +213,12 @@ impl SessionStore {
             };
             self.commit(Fact::ModelSettled {
                 request,
-                message: None,
-                error: Some(format!("{reason}: {status}")),
+                result: None,
+                error: Some(ModelError {
+                    code: "interrupted".into(),
+                    message: format!("{reason}: {status}"),
+                    details: serde_json::Value::Null,
+                }),
             })?;
         }
         let calls = self.projection.pending_tools.clone();
@@ -241,6 +274,27 @@ impl SessionStore {
         Ok(())
     }
 
+    pub fn facts(&self) -> Result<serde_json::Value> {
+        if let Some(legacy) = &self.legacy {
+            return Ok(serde_json::to_value(&legacy.records)?);
+        }
+        Ok(serde_json::to_value(&self.records)?)
+    }
+
+    pub fn audit(&self, id: &str) -> Result<serde_json::Value> {
+        if let Some(legacy) = &self.legacy {
+            return legacy.audit(id);
+        }
+        let request = self
+            .projection
+            .requests
+            .get(id)
+            .context("unknown request")?;
+        Ok(
+            serde_json::json!({"protocol":2,"prepared":request,"input":self.projection.reconstruct(request)?,"plan":request.plan}),
+        )
+    }
+
     fn last_hash(&self) -> String {
         self.records
             .last()
@@ -261,6 +315,93 @@ fn record_hash(seq: u32, previous: &str, fact: &Fact) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_preparation_append_never_dispatches_provider_execution() {
+        use crate::{rpc::Peer, runtime::Runtime};
+        use serde_json::{Value, json};
+        use std::{collections::HashMap, sync::Arc};
+        use tokio::sync::{Mutex, Notify, broadcast};
+        use tokio_util::sync::CancellationToken;
+        let root =
+            std::env::temp_dir().join(format!("morrow-provider-write-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let runtime = Arc::new(Runtime {
+            home: root.clone(),
+            workspace: root.clone(),
+            sessions: Mutex::new(HashMap::new()),
+            peer: Mutex::new(None),
+            ready: Notify::new(),
+            events: broadcast::channel(32).0,
+            shutdown: CancellationToken::new(),
+            auto_approve: false,
+        });
+        let session = runtime.session("test").await.unwrap();
+        let registration = Registration {
+            kind: "model".into(),
+            name: "test".into(),
+            plugin: "test".into(),
+            version: "1".into(),
+            scope: "application".into(),
+            epoch: "epoch".into(),
+            generation: 0,
+            tool: None,
+        };
+        {
+            let mut store = session.store.lock().await;
+            store
+                .commit(Fact::InputQueued {
+                    submission: "i".into(),
+                    message: Message::text(Role::User, "hello"),
+                })
+                .unwrap();
+            store
+                .commit(Fact::RunStarted {
+                    run: "r".into(),
+                    submission: "i".into(),
+                    epoch: "epoch".into(),
+                })
+                .unwrap();
+            store
+                .commit(Fact::StepStarted {
+                    run: "r".into(),
+                    step: "s".into(),
+                    registrations: vec![registration],
+                })
+                .unwrap();
+        }
+        let (peer, mut calls) = Peer::test_connection();
+        let task_runtime = runtime.clone();
+        let task_peer = peer.clone();
+        let task = tokio::spawn(async move {
+            task_runtime.model_call(&task_peer,"test", &json!({"id":"request","run":"r","step":"s","purpose":"main","header":{"provider":"test","model":"m","system":"","tools":[],"parameters":{}}})).await
+        });
+        let message = tokio::time::timeout(std::time::Duration::from_secs(2), calls.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let axum::extract::ws::Message::Text(message) = message else {
+            panic!("expected request")
+        };
+        let value: Value = serde_json::from_str(&message).unwrap();
+        assert_eq!(value["method"], "provider.prepare");
+        session.store.lock().await.file =
+            File::open(crate::sessions::path(&root, &root, "test").unwrap()).unwrap();
+        peer.test_reply(
+            value["id"].as_str().unwrap(),
+            json!({"format":"test","payload":{}}),
+        );
+        assert!(task.await.unwrap().is_err());
+        assert!(calls.try_recv().is_err());
+        let store = session.store.lock().await;
+        assert!(store.projection.requests["request"].plan.is_none());
+        assert!(store.projection.effects.is_empty());
+        assert!(store.poisoned);
+        drop(store);
+        drop(session);
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn failed_durable_append_never_updates_projection_and_poisoned_writer_rejects_later_work() {

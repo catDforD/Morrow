@@ -9,6 +9,8 @@ use crate::protocol::*;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
 pub struct Projection {
+    #[serde(default)]
+    pub legacy: bool,
     pub seq: u32,
     pub workspace: String,
     pub parent: Option<String>,
@@ -46,6 +48,8 @@ pub struct Projection {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct Node {
     pub message: Message,
+    #[serde(default)]
+    pub continuation: Option<Continuation>,
     pub covers: Vec<String>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -105,7 +109,17 @@ impl Projection {
         let mut messages = self.messages(&request.surface)?;
         messages.extend(request.temporary.clone());
         validate_messages(&messages, true)?;
-        Ok(provider_body(&request.header, &messages))
+        let mut continuations: Vec<_> = request
+            .surface
+            .iter()
+            .map(|id| self.nodes[id].continuation.clone())
+            .collect();
+        continuations.extend(request.temporary.iter().map(|_| None));
+        Ok(serde_json::to_value(ModelInput {
+            header: request.header.clone(),
+            messages,
+            continuations,
+        })?)
     }
 
     pub fn require_run(&self, id: &str) -> Result<()> {
@@ -162,6 +176,27 @@ impl Projection {
 
     pub fn validate(&self, fact: &Fact) -> Result<()> {
         match fact {
+            Fact::SessionImported {
+                source,
+                nodes,
+                surface,
+                ..
+            } => {
+                ensure!(
+                    self.seq == 1 && self.nodes.is_empty() && !source.is_empty(),
+                    "import must follow session open"
+                );
+                let messages: Vec<_> = surface
+                    .iter()
+                    .map(|id| {
+                        nodes
+                            .get(id)
+                            .map(|n| n.message.clone())
+                            .ok_or_else(|| anyhow::anyhow!("missing import node"))
+                    })
+                    .collect::<Result<_>>()?;
+                validate_messages(&messages, true)?;
+            }
             Fact::SessionOpened { workspace, .. } => ensure!(
                 self.seq == 0 && !workspace.is_empty(),
                 "session already opened"
@@ -235,7 +270,11 @@ impl Projection {
                     "step has missing tool results"
                 );
             }
-            Fact::RequestPrepared { request } => {
+            Fact::ModelRequested { request } => {
+                ensure!(
+                    serde_json::to_vec(request)?.len() <= 8_000_000,
+                    "model input exceeds 8 MB"
+                );
                 self.require_run(&request.run)?;
                 self.require_step(&request.step)?;
                 ensure!(
@@ -281,21 +320,6 @@ impl Projection {
                     request.header.parameters.is_object(),
                     "model parameters must be an object"
                 );
-                for key in request.header.parameters.as_object().unwrap().keys() {
-                    ensure!(
-                        [
-                            "temperature",
-                            "top_p",
-                            "max_tokens",
-                            "max_completion_tokens",
-                            "reasoning_effort",
-                            "thinking",
-                            "seed"
-                        ]
-                        .contains(&key.as_str()),
-                        "unsupported model parameter: {key}"
-                    );
-                }
                 for tool in &request.header.tools {
                     ensure!(
                         request
@@ -305,9 +329,44 @@ impl Projection {
                         "tool missing from step snapshot"
                     );
                 }
+                ensure!(request.plan.is_none(), "request already prepared");
                 ensure!(
-                    self.reconstruct(request)? == request.body,
-                    "prepared body does not match its provenance"
+                    request
+                        .registrations
+                        .iter()
+                        .any(|r| r.kind == "model" && r.name == request.header.provider),
+                    "provider missing from step snapshot"
+                );
+                if let Some(prior) = &request.retry_of {
+                    ensure!(
+                        self.settled_requests.contains(prior),
+                        "retry requires a settled request"
+                    );
+                }
+                self.reconstruct(request)?;
+            }
+            Fact::RequestPrepared { request } => {
+                self.require_run(&request.run)?;
+                self.require_step(&request.step)?;
+                ensure!(request.revision == self.revision, "stale surface revision");
+                let mut original = request.clone();
+                original.plan = None;
+                ensure!(
+                    self.requests.get(&request.id) == Some(&original),
+                    "prepared source changed or already prepared"
+                );
+                ensure!(
+                    !self.settled_requests.contains(&request.id),
+                    "request already settled"
+                );
+                let plan = request
+                    .plan
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("missing prepared plan"))?;
+                ensure!(!plan.format.is_empty(), "missing plan format");
+                ensure!(
+                    serde_json::to_vec(plan)?.len() <= 8_000_000,
+                    "plan too large"
                 );
             }
             Fact::EffectStarted {
@@ -325,7 +384,7 @@ impl Projection {
                     ensure!(
                         self.requests
                             .get(id)
-                            .is_some_and(|r| r.run == *run && r.step == *step),
+                            .is_some_and(|r| r.run == *run && r.step == *step && r.plan.is_some()),
                         "model effect requires prepared request"
                     );
                     ensure!(
@@ -341,7 +400,7 @@ impl Projection {
             ),
             Fact::ModelSettled {
                 request,
-                message,
+                result,
                 error,
             } => {
                 let prepared = self
@@ -353,10 +412,32 @@ impl Projection {
                     "request already settled"
                 );
                 ensure!(
-                    message.is_some() != error.is_some(),
+                    result.is_some() != error.is_some(),
                     "model settlement requires either message or error"
                 );
-                if let Some(message) = message {
+                if let Some(result) = result {
+                    let message = &result.message;
+                    ensure!(
+                        self.effects.get(request).is_some_and(
+                            |e| e.output == serde_json::to_value(result).unwrap_or(Value::Null)
+                        ),
+                        "model result differs from settled effect"
+                    );
+                    ensure!(
+                        !message.content.is_empty() || !message.tool_calls.is_empty(),
+                        "empty model response"
+                    );
+                    if let Some(continuation) = &result.continuation {
+                        ensure!(
+                            continuation.provider == prepared.header.provider
+                                && !continuation.format.is_empty(),
+                            "invalid continuation owner"
+                        );
+                        ensure!(
+                            serde_json::to_vec(continuation)?.len() <= 8_000_000,
+                            "continuation too large"
+                        );
+                    }
                     ensure!(
                         self.effects
                             .get(request)
@@ -508,6 +589,11 @@ impl Projection {
 
     pub(crate) fn apply_validated(&mut self, fact: &Fact) {
         match fact {
+            Fact::SessionImported { nodes, surface, .. } => {
+                self.nodes = nodes.clone();
+                self.surface = surface.clone();
+                self.revision += 1;
+            }
             Fact::SessionOpened { workspace, parent } => {
                 self.workspace = workspace.clone();
                 self.parent = parent.clone();
@@ -551,7 +637,7 @@ impl Projection {
             Fact::StepEnded { .. } => {
                 self.step = None;
             }
-            Fact::RequestPrepared { request } => {
+            Fact::ModelRequested { request } | Fact::RequestPrepared { request } => {
                 self.requests.insert(request.id.clone(), request.clone());
             }
             Fact::EffectStarted {
@@ -585,10 +671,11 @@ impl Projection {
                 e.output = output.clone();
             }
             Fact::ModelSettled {
-                request, message, ..
+                request, result, ..
             } => {
                 self.settled_requests.insert(request.clone());
-                if let Some(message) = message {
+                if let Some(result) = result {
+                    let message = &result.message;
                     if self.requests[request].purpose == "main" {
                         self.pending_tools = message
                             .tool_calls
@@ -596,11 +683,14 @@ impl Projection {
                             .map(|call| call.id.clone())
                             .collect();
                         self.append(request.clone(), message.clone(), vec![]);
+                        self.nodes.get_mut(request).unwrap().continuation =
+                            result.continuation.clone();
                     } else {
                         self.nodes.insert(
                             request.clone(),
                             Node {
                                 message: message.clone(),
+                                continuation: result.continuation.clone(),
                                 covers: vec![],
                             },
                         );
@@ -613,6 +703,7 @@ impl Projection {
                     id.clone(),
                     Node {
                         message: message.clone(),
+                        continuation: None,
                         covers: vec![],
                     },
                 );
@@ -663,6 +754,7 @@ impl Projection {
                     id.clone(),
                     Node {
                         message: message.clone(),
+                        continuation: None,
                         covers: covers.clone(),
                     },
                 );
@@ -718,7 +810,14 @@ impl Projection {
         )
     }
     fn append(&mut self, id: String, message: Message, covers: Vec<String>) {
-        self.nodes.insert(id.clone(), Node { message, covers });
+        self.nodes.insert(
+            id.clone(),
+            Node {
+                message,
+                covers,
+                continuation: None,
+            },
+        );
         self.surface.push(id);
         self.revision += 1;
     }

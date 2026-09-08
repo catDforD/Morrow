@@ -15,7 +15,7 @@ try {
     assert.equal(Object.keys(state.requests).length, 1)
     const request = Object.values(state.requests)[0]
     const audit = await server.api(`/session/work/request/${request.id}`)
-    assert.deepEqual(audit.reconstructed, request.body)
+    assert.deepEqual(audit.plan, request.plan)
   })
   await check('duplicate submission cannot repeat effects', async () => {
     const before = await server.state('work')
@@ -80,11 +80,11 @@ try {
     await run(server, 'work', 'hello after restart')
     assert.deepEqual((await server.state('work')).plugin_state[stats.name], before)
   })
-  await check('all prepared requests exactly reconstruct after restart', async () => {
+  await check('all provider plans and input provenance survive restart', async () => {
     const state = await server.state('work')
     for (const request of Object.values(state.requests)) {
       const audit = await server.api(`/session/work/request/${request.id}`)
-      assert.deepEqual(audit.reconstructed, request.body)
+      assert.deepEqual(audit.plan, request.plan)
     }
   })
   await check('compaction uses an auditable summary request and balanced replacement', async () => {
@@ -94,7 +94,7 @@ try {
     const replacement = records.findLast(r => r.fact.type === 'surface_replaced').fact
     assert.ok(replacement.covers.length > 1)
     assert.equal(state.requests[replacement.source_request].purpose, 'summary')
-    for (const request of Object.values(state.requests)) assert.deepEqual((await server.api(`/session/work/request/${request.id}`)).reconstructed, request.body)
+    for (const request of Object.values(state.requests)) assert.deepEqual((await server.api(`/session/work/request/${request.id}`)).plan, request.plan)
   })
   await check('malformed model tool calls fail before entering context', async () => {
     const state = await run(server, 'sibling', 'malformed')
@@ -134,7 +134,12 @@ try {
   })
   await check('host crash settles in-flight tools as unknown and never repeats them', async () => {
     await define(server, 'sibling', {name:'test.crash',description:'Crash fixture',client:null,dependency_lock:'{}',host:`export default ctx=>{ctx.morrow.tool({name:'crash_host',description:'',parameters:{type:'object'},approval:false},()=>process.exit(23))}`})
-    const state = await run(server, 'sibling', 'crash host')
+    const exited = new Promise(resolve => server.child.once('exit', resolve))
+    await server.action('sibling', 'submit', { text: 'crash host', submission: 'crash-once' })
+    await exited
+    await until(async () => { try { await server.state('sibling'); return false } catch { return true } })
+    server = await start(env)
+    const state = await server.state('sibling')
     assert.notEqual(state.last_outcome, 'completed')
     const effects = Object.values(state.effects).filter(e => e.name === 'crash_host')
     assert.equal(effects.length, 1)

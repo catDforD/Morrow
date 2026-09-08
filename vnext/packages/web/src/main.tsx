@@ -9,6 +9,7 @@ import { ApprovalDialog, Inspector, type InspectorTab } from './Inspector.js'
 import { Settings, type SettingsSection } from './Settings.js'
 import { useSession } from './useSession.js'
 import { snapshot } from './api.js'
+import { pageSection, PluginView } from './plugins.js'
 import './styles.css'
 import './style.css'
 
@@ -24,8 +25,24 @@ function useMedia(query: string) {
 }
 
 function App() {
-  const [session, setSession] = useState(() => sessionStorage.getItem('morrow-session') || 'default')
-  return <Workspace key={session} session={session} onSession={name => { sessionStorage.setItem('morrow-session', name); setSession(name) }} />
+  const [active, setActive] = useState<{ workspace: string; session: string }>()
+  const [error, setError] = useState('')
+  const [attempt, setAttempt] = useState(0)
+  useEffect(() => {
+    let disposed = false
+    void snapshot('_workspace').then(({ workspace }) => {
+      if (disposed) return
+      const saved = sessionStorage.getItem(`morrow-session:${workspace.workspace}`)
+      const session = saved && /^[a-zA-Z0-9_-]{1,128}$/.test(saved) && saved !== '_workspace' ? saved : 'default'
+      setActive({ workspace: workspace.workspace, session }); setError('')
+    }).catch(error => { if (!disposed) setError(String(error)) })
+    return () => { disposed = true }
+  }, [attempt])
+  if (!active) return <div className="extension-card"><p role={error ? 'alert' : 'status'}>{error || '正在加载工作区…'}</p>{error && <button className="secondary-button" onClick={() => setAttempt(value => value + 1)}>重试</button>}</div>
+  return <Workspace key={`${active.workspace}:${active.session}`} session={active.session} onSession={name => {
+    sessionStorage.setItem(`morrow-session:${active.workspace}`, name)
+    setActive({ ...active, session: name })
+  }} />
 }
 
 function Workspace({ session, onSession }: { session: string; onSession(name: string): void }) {
@@ -98,20 +115,25 @@ function Workspace({ session, onSession }: { session: string; onSession(name: st
     try { await perform('approve', { id: pending[0], approved }) } finally { setBusy(false) }
   }
   const filtered = sessions.filter(entry => entry.name.toLowerCase().includes(filter.toLowerCase()))
-  const config = state?.plugin_state['morrow.settings']?.model
-  const configuredModel = config && typeof config === 'object' && !Array.isArray(config) && typeof config.model === 'string' ? config.model : ''
-  const model = configuredModel || Object.values(state?.requests ?? {}).at(-1)?.header.model || ''
+  const latestModel = timeline.findLast(record => record.fact.type === 'request_prepared' && record.fact.request.purpose === 'main')?.fact
+  const model = latestModel?.type === 'request_prepared' ? latestModel.request.header.model : ''
   const connectionState = pending ? 'approval' : state?.run ? 'running' : connection
   const connectionLabels = { connected: '已连接', connecting: '连接中', disconnected: '未连接', running: '正在执行', approval: '等待确认' }
+  const modelSettings = views.find(view => view.kind === 'page' && view.shortcut === 'models')
+  const composerViews = views.filter(view => view.kind === 'composer').sort((a, b) => (a.order ?? 50) - (b.order ?? 50))
   const composer = <Composer prompt={prompt} onPromptChange={setPrompt} onSubmit={() => void submit()} onCancel={() => void perform('cancel')}
-    running={Boolean(state?.run)} busy={busy} enabled={Boolean(state)} workspace={state?.workspace ?? ''} model={model} home={empty} onManageModels={() => openSettings('models')} />
+    actions={state && composerViews.length ? composerViews.map(view => <PluginView key={`${view.plugin}:${view.name}`} view={view} session={session} state={state} disabled={busy || Boolean(state.run) || state.legacy} openPage={name => {
+      const page = views.find(page => page.kind === 'page' && page.plugin === view.plugin && page.name === name)
+      if (page) openSettings(pageSection(page))
+    }} />) : undefined}
+    running={Boolean(state?.run)} busy={busy} enabled={Boolean(state)} workspace={state?.workspace ?? ''} model={model} home={empty} onManageModels={() => openSettings(modelSettings ? pageSection(modelSettings) : 'general')} />
 
   return <>
     <div inert={Boolean(pending)}>
       {error && <div className="session-status-banner error app-status" role="alert"><span>{error}</span><button type="button" onClick={() => { setError(''); void refresh(); void refreshDirectory() }}>重试</button><MiniIconButton title="关闭提示" onClick={() => setError('')}><X size={14} /></MiniIconButton></div>}
       {settings && state && data ? <Settings session={session} state={state} workspace={data.workspace} section={settings} onSection={section => { setSettings(section); setSidebarOpen(false) }}
         theme={theme} onTheme={toggleTheme} sidebarOpen={sidebarOpen} onSidebar={setSidebarOpen} onBack={() => { setSettings(null); setSidebarOpen(false) }} report={setError}
-        perform={perform} enableClients={() => setEnabled(true)} views={views} onSaved={refresh} /> :
+        perform={perform} enableClients={() => setEnabled(true)} views={views} /> :
         <div className={`app-frame${sidebarOpen ? ' sidebar-open' : ''}${collapsed ? ' sidebar-collapsed' : ''}${inspector ? ' inspector-open' : ''}`}>
           <button className="mobile-sidebar-backdrop" type="button" aria-label="关闭会话导航" aria-hidden={!sidebarOpen} tabIndex={sidebarOpen ? 0 : -1} onClick={() => setSidebarOpen(false)} />
           <AppSidebar sessions={filtered.filter(entry => !archived.includes(entry.name))} archivedSessions={filtered.filter(entry => archived.includes(entry.name))}

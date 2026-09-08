@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct ToolCall {
@@ -71,6 +71,9 @@ pub struct Registration {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct RequestHeader {
+    #[serde(default)]
+    #[ts(optional)]
+    pub profile: Option<String>,
     pub provider: String,
     pub model: String,
     pub system: String,
@@ -89,9 +92,61 @@ pub struct PreparedRequest {
     pub temporary: Vec<Message>,
     pub header: RequestHeader,
     pub registrations: Vec<Registration>,
-    /// Exact provider body. Credentials and transport configuration live outside this record.
-    pub body: Value,
+    // Option 表示“可能还没有”：请求先落盘，Node 准备成功后才变成 Some(plan)。
+    pub plan: Option<PreparedPlan>,
+    #[serde(default)]
+    pub retry_of: Option<String>,
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct PreparedPlan {
+    pub format: String,
+    // Value 是任意 JSON。Rust 保存它，但不解释某家模型 API 的字段。
+    pub payload: Value,
+    #[serde(default)]
+    #[ts(optional)]
+    pub profile: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct Continuation {
+    pub provider: String,
+    pub format: String,
+    // provider 专属的续接数据（例如加密 reasoning），不是可展示的聊天正文。
+    pub data: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct ModelInput {
+    pub header: RequestHeader,
+    pub messages: Vec<Message>,
+    pub continuations: Vec<Option<Continuation>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct ModelResult {
+    pub message: Message,
+    #[serde(default)]
+    pub continuation: Option<Continuation>,
+    #[serde(default)]
+    pub usage: Value,
+    pub finish_reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct ModelError {
+    pub code: String,
+    pub message: String,
+    #[serde(default)]
+    pub details: Value,
+}
+
+impl std::fmt::Display for ModelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+impl std::error::Error for ModelError {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -122,6 +177,13 @@ pub struct PluginVersion {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Fact {
+    SessionImported {
+        source: String,
+        seq: u32,
+        hash: String,
+        nodes: std::collections::BTreeMap<String, crate::projection::Node>,
+        surface: Vec<String>,
+    },
     SessionOpened {
         workspace: String,
         parent: Option<String>,
@@ -143,6 +205,9 @@ pub enum Fact {
     StepEnded {
         step: String,
     },
+    ModelRequested {
+        request: PreparedRequest,
+    },
     RequestPrepared {
         request: PreparedRequest,
     },
@@ -161,8 +226,8 @@ pub enum Fact {
     },
     ModelSettled {
         request: String,
-        message: Option<Message>,
-        error: Option<String>,
+        result: Option<ModelResult>,
+        error: Option<ModelError>,
     },
     ToolSettled {
         call: String,
@@ -231,43 +296,4 @@ pub struct Record {
     pub previous: String,
     pub fact: Fact,
     pub hash: String,
-}
-
-pub fn provider_body(header: &RequestHeader, messages: &[Message]) -> Value {
-    use serde_json::json;
-    let mut wire_messages = vec![];
-    if !header.system.is_empty() {
-        wire_messages.push(json!({"role":"system", "content":header.system}));
-    }
-    for message in messages {
-        let mut wire = json!({"role":message.role,"content":message.content});
-        if !message.reasoning.is_empty() {
-            wire["reasoning_content"] = json!(message.reasoning);
-        }
-        if !message.tool_calls.is_empty() {
-            wire["tool_calls"] = json!(message.tool_calls.iter().map(|call| json!({
-                "id":call.id, "type":"function", "function":{"name":call.name,"arguments":call.arguments.to_string()}
-            })).collect::<Vec<_>>());
-        }
-        if let Some(id) = &message.tool_call_id {
-            wire["tool_call_id"] = json!(id);
-        }
-        wire_messages.push(wire);
-    }
-    let mut body = header.parameters.clone();
-    body["model"] = json!(header.model);
-    body["messages"] = json!(wire_messages);
-    body["stream"] = json!(true);
-    if !header.tools.is_empty() {
-        body["tools"] = json!(
-            header
-                .tools
-                .iter()
-                .map(|tool| json!({"type":"function","function":{
-                    "name":tool.name,"description":tool.description,"parameters":tool.parameters
-                }}))
-                .collect::<Vec<_>>()
-        );
-    }
-    body
 }

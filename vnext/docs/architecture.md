@@ -1,6 +1,6 @@
 # Morrow vNext：新版 Agent 架构导读
 
-本文依据 **2026-09-07 的当前实现**，覆盖 `vnext/` 独立工程。入口程序为 `morrow-next`，默认数据目录为 `~/.morrow-vnext/`。根目录 `crates/agent-*` 属于旧实现；新版有自己的 Rust workspace、Node Host 和 Web 应用。
+本文覆盖 `vnext/` 独立工程。入口程序为 `morrow`，`morrow server` 或直接 `morrow` 启动 Web 服务，默认数据目录为 `~/.morrow-vnext/`。根目录 `crates/agent-*` 属于旧实现；新版有自己的 Rust workspace、Node Host 和 Web 应用。
 
 阅读路线：先看整体关系和术语，再沿一次请求理解执行过程，最后阅读事实、上下文和插件机制。文中的文件链接均指向当前源码。
 
@@ -22,7 +22,7 @@
 
 **Rust 管理可信状态与执行边界，Node 插件决定 Agent 的具体行为，React 展示会话并承载前端扩展。**
 
-一个服务实例包含一个 Rust 进程、一个受它监督的 Node Host 进程，以及连接服务的浏览器。多个 Session 共享这两个服务进程；每个 Session 拥有独立事实日志和独立的 Host 插件上下文。
+一个服务实例包含作为启动入口的 Node Host 进程、由它启动的 Rust kernel 子进程，以及连接服务的浏览器。多个 Session 共享这两个服务进程；每个 Session 拥有独立事实日志和独立的 Host 插件上下文。
 
 ![新版 Agent 整体架构](diagrams/overview.svg)
 
@@ -31,7 +31,7 @@
 | 层次 | 负责的事情 | 关键设计理由 |
 | --- | --- | --- |
 | Rust 内核 | 输入排队、Run/Step 约束、事实落盘、审批、模型与工具执行边界、子会话 | 把可恢复状态和执行约束集中到一个权威实现 |
-| Node Host | 加载 Cordis 插件，提供默认 Agent 循环，调用工具、模型和策略扩展 | 业务能力可以通过 JavaScript/TypeScript 插件迭代 |
+| Node Host | 加载 Cordis 插件，提供默认 Agent 循环、模型协议、凭据和策略扩展 | 业务能力可以通过 JavaScript/TypeScript 插件迭代 |
 | Web | 聊天、审批、设置、事实查看，以及插件页面和面板 | 保留应用外壳，为新功能提供展示入口 |
 
 默认 ReAct 循环位于 [defaults.ts](../packages/host/src/defaults.ts) 的 `agent()` 中。Rust 的 [runtime.rs](../crates/kernel/src/runtime.rs) 管理一个 run 何时开始、结束，以及操作是否仍属于有效执行。理解这两个职责，有助于判断新功能应放进插件还是内核。
@@ -42,13 +42,13 @@
 
 ```text
 vnext/
-├── crates/kernel/src/       Rust 内核、CLI 与 HTTP 服务
-│   ├── main.rs              启动、进程监督、命令入口
+├── crates/kernel/src/       Rust 内核、私有进程入口与 HTTP 服务
+│   ├── main.rs              私有 kernel 入口、本地服务与父进程退出检测
 │   ├── protocol.rs          Fact、Message、PreparedRequest 等协议
 │   ├── projection.rs        状态校验与统一 reducer
 │   ├── store.rs             JSONL 存储、回放与中断收尾
 │   ├── runtime.rs           Session 编排、Host RPC、插件和子会话
-│   ├── effects.rs           模型请求、工具执行、审批和 SSE
+│   ├── effects.rs           provider 准备/执行边界、工具执行和审批
 │   ├── rpc.rs               Rust ↔ Node 双向 JSON-RPC
 │   └── server.rs            HTTP、WebSocket、Web 静态资源
 ├── packages/
@@ -84,11 +84,11 @@ vnext/
 
 ### 3.1 启动装配
 
-[main.rs](../crates/kernel/src/main.rs) 读取工作区、数据目录和模型配置，创建 `Runtime`，启动本地 Axum 服务，再启动 Node Host。Host 连接 `/host`，通过 `host.ready` 握手取得 epoch。Rust 等待 Host 就绪后输出浏览器地址或执行 CLI 输入。
+[launcher.ts](../packages/host/src/launcher.ts) 读取 Host profile，以明确的环境变量白名单启动 Rust kernel。Rust 的 [main.rs](../crates/kernel/src/main.rs) 通过私有 stdout 管道通知本地服务地址和认证信息；Node 连接 `/host`，完成协议 v2 握手后报告应用就绪。
 
-Rust 和 Host 使用独立于浏览器的连接令牌。原生模型请求使用 Rust 中的 `OPENAI_API_KEY`，启动 Node 子进程时会移除这个环境变量。浏览器接收自己的临时访问令牌。
+Rust 和 Host 使用独立于浏览器的连接令牌。模型 API key 由 Node 的 Profiles 服务管理，provider 在 execute 阶段使用。网页保存凭据通过现有 Rust RPC 转发；Rust 不配置模型密钥，不将它写入事实记录。
 
-Host 退出后由启动器尝试重新拉起。新进程需要重新加载插件对象，持久化状态从 Rust 读取。
+Host 退出会关闭父子管道；Rust 取消活动 run 并收尾退出。重新启动应用后从事实恢复；Unknown 操作不自动重发。
 
 ### 3.2 默认执行路径
 
@@ -103,7 +103,7 @@ Host 退出后由启动器尝试重新拉起。新进程需要重新加载插件
 3. **选择 Driver。** Host 加载有效插件，选择名为 `default` 的 driver，并将它固定到本次 run 结束。
 4. **开始 Step。** `run.beginStep()` 同步插件，固定本步注册快照，然后让 Rust 记录 `step_started`。
 5. **准备请求。** `run.prepare()` 执行 policy 链，形成模型、工具列表、系统提示和临时消息。
-6. **调用模型。** Rust 创建 `PreparedRequest` 并落盘，再执行模型调用。`openai` Provider 走原生 HTTP，其余 Provider 根据本步注册快照回调 Host。
+6. **调用模型。** Rust 提交 `model_requested` 固定输入，回调 Node provider.prepare；提交 `request_prepared` 和 `effect_started` 后，回调同一 provider.execute。所有 provider 经过统一路径，HTTP 与协议解析均在 Node。
 7. **执行工具。** 默认 driver 遍历模型的 `tool_calls`。Rust 检查注册、审批及执行状态，再执行内置工具或回调插件。Driver 最后调用 `run.settle()` 将工具结果回灌上下文。
 8. **继续或结束。** 记录 `step_ended`；有工具调用则进入下一步，无工具调用则结束 run。默认上限为 32 步。
 
@@ -136,7 +136,7 @@ Host 退出后由启动器尝试重新拉起。新进程需要重新加载插件
 
 [编辑图源](diagrams/context-views.mmd)
 
-回放重新计算当前状态，不会重新执行模型请求、Shell 或插件工具。流式 `delta` 是临时显示通知；模型最终结果通过事实保存。
+回放重新计算当前状态，不会重新执行模型请求、Shell 或插件工具。`model_progress` 是临时显示通知；模型最终结果通过事实保存。
 
 ### 4.2 主要事实分组
 
@@ -156,9 +156,11 @@ Host 退出后由启动器尝试重新拉起。新进程需要重新加载插件
 ```text
 ~/.morrow-vnext/
 ├── sessions/
-│   ├── default.jsonl
-│   ├── child-<uuid>.jsonl
-│   └── workspace-<工作区路径哈希>.jsonl
+│   ├── <工作区路径哈希>/
+│   │   ├── default.jsonl
+│   │   └── child-<uuid>.jsonl
+│   ├── workspace-v2-<工作区路径哈希>.jsonl
+│   └── <旧会话名>.jsonl  旧版布局的日志保留原位
 └── plugins/<版本哈希>/
     ├── manifest.json
     ├── host.mjs
@@ -166,6 +168,10 @@ Host 退出后由启动器尝试重新拉起。新进程需要重新加载插件
 ```
 
 `_workspace` 是 API 中代表工作区级插件状态的特殊名称，实际映射到带路径哈希的日志文件。打开日志时会校验所属工作区，并获取文件锁，防止两个进程同时操作同一日志。
+
+普通会话与子会话按规范化工作区路径的哈希分目录，因而不同项目可以使用相同的会话名。路径解析与会话列表过滤位于 [sessions.rs](../crates/kernel/src/sessions.rs)：旧平铺日志先只读检查首条记录中的工作区，仅在属于当前项目时继续使用原文件；其他项目的同名日志不被打开为 writer，也不被修改。v1 复制迁移的新会话同样使用工作区目录，事实格式保持不变。
+
+浏览器先读取工作区，再按工作区记住当前会话。同一标签页打开新的启动 token 链接时会重新初始化页面，避免同端口切换项目后沿用旧工作区和 WebSocket。供应商与凭据仍由 Node 存放在 home 中共享，插件文件按版本哈希共享，启用绑定和会话历史按各自作用域隔离。
 
 当前日志与完整投影在打开后驻留内存，尚未实现分段日志或持久化快照加速。较长会话的启动成本会随历史增长。
 
@@ -203,9 +209,11 @@ Host 退出后由启动器尝试重新拉起。新进程需要重新加载插件
 
 ### 5.3 一次模型请求如何重建
 
-`PreparedRequest` 固定保存：此次选用的 `surface`、上下文 revision、`temporary` 消息、请求 header、本步注册快照，以及生成的请求 `body`。
+`PreparedRequest` 固定保存此次 `surface`、revision、`temporary`、header、本步注册快照和 Node 生成的无凭据 plan；plan 保存协议格式、payload 和公开 profile 快照。
 
-`Projection.reconstruct()` 按请求保存的节点 ID 读取消息，追加临时消息，再通过统一规则构造 Provider body。当前 Surface 后来即使压缩了，旧节点仍然可用，因此历史请求仍可重建并与保存的 body 比较。
+`Projection.reconstruct()` 按请求中的节点 ID 重建统一消息与对应 continuation，并追加临时消息。Provider 负责将统一输入编码为具体协议；Rust 校验来源和执行关系，保存 plan。历史查看无需启动 provider，协议转换正确性由 adapter 测试验证。
+
+模型结果以 `ModelResult` 保存通用 Message、provider 专用 continuation、usage 和结束原因。两部分一起持久化；压缩后旧节点继续保留，但其 continuation 不再进入当前 Surface 的输入。Responses 默认采用本地上下文和 `store: false`。
 
 Web 聊天历史由 [Conversation.tsx](../packages/web/src/Conversation.tsx) 根据完整事实日志整理，模型输入使用 Surface。压缩后用户仍能看到原对话；临时提示消息可以影响某次模型请求而不成为聊天记录。
 
@@ -236,7 +244,8 @@ Host 的注册表按这个顺序合并同种类、同名称的贡献，最近一
 | API | 用途 | 调用位置 |
 | --- | --- | --- |
 | `ctx.morrow.tool()` | 新工具，也可组合调用内置工具 | Driver 请求工具后，由 Rust 校验并回调 |
-| `ctx.morrow.model()` | 自定义模型 Provider | `header.provider` 匹配注册名称时调用 |
+| `ctx.morrow.provider()` | prepare / execute 模型协议插件 | 固定输入 → 准备 → Rust 落盘 → 执行 |
+| `ctx.morrow.model()` | 旧单回调插件兼容 | Node shim 提供旧 body 形状，新插件使用 provider() |
 | `ctx.morrow.driver('default', ...)` | 替换执行循环与停止条件 | 每个 run 启动时选择 |
 | `ctx.morrow.policy()` | 调整请求 header、临时消息，执行压缩等准备逻辑 | Driver 显式调用 `run.prepare()` 时 |
 | `ctx.morrow.method()` | 向 Web 暴露当前插件的公开方法 | Client 通过 `invoke()` 调用 |
@@ -275,7 +284,7 @@ Web 外壳位于 [main.tsx](../packages/web/src/main.tsx)，[useSession.ts](../p
 | `GET /api/session/:session/facts` | 完整事实时间线 |
 | `GET /api/session/:session/request/:id` | 保存的请求与重建结果 |
 | `POST /api/session/:session` | `submit/cancel/approve`、插件管理、`resume/invoke` 等操作 |
-| WebSocket `/events` | 事实通知、临时 delta、重同步和 Host 断开通知 |
+| WebSocket `/events` | 事实通知、model_progress、重同步和 Host 断开通知 |
 | WebSocket `/host` | Node Host 的双向 RPC，使用独立认证 |
 
 Web 收到事实通知后重新获取快照和日志；当前浏览器没有维护一份与 Rust 对等的完整 reducer。订阅缓冲落后时服务端发送 `resync`，浏览器重新取数。
@@ -285,14 +294,17 @@ Client 插件通过 [plugins.tsx](../packages/web/src/plugins.tsx) 注册 React 
 | 扩展 | 当前实际挂载位置 |
 | --- | --- |
 | `ctx.ui.panel(name, Component)` | 右侧详情中的“会话面板” |
-| `ctx.ui.page(name, Component)` | 设置导航中的插件页面 |
+| `ctx.ui.page(name, Component, options?)` | 设置导航中的插件页面；可声明 order、icon 和 shortcut |
+| `ctx.ui.composer(name, Component, options?)` | 聊天输入框工具栏；可声明 order |
 | `ctx.ui.renderer(role, Component)` | 按 `user/assistant/tool` 等消息角色选择渲染组件 |
 
-组件收到 `{ state, invoke, message }`。`state` 为该插件命名空间下的数据；`invoke(method, input)` 定位当前 Session、插件及版本注册的公开 Host method；消息 renderer 还收到 `message`。React 由宿主共享，可通过 `ctx.ui.react` 获取。
+组件收到 `{ state, invoke, message, disabled, openPage }`。`state` 为该插件命名空间下的数据；`invoke(method, input)` 定位当前 Session、插件及版本注册的公开 Host method；消息 renderer 还收到 `message`。输入框扩展通过可选的 `disabled` 跟随会话执行状态，通过 `openPage(name)` 打开同一插件注册的设置页面。React 由宿主共享，可通过 `ctx.ui.react` 获取。
 
 以 [项目统计 Host](../examples/project-stats.host.mjs) 和 [对应 Client](../examples/project-stats.client.mjs) 为例：Agent 调用 `project_stats` → Host 组合内置文件工具 → `setState('stats', result)` 写入事实 → Web 获取新投影 → 统计面板展示新数据。这个插件不需要修改 Rust 协议或 Web 外壳。
 
-历史浏览和插件执行分别管理。发送输入或调用 `resume` 会恢复 Host 插件；浏览器在发送输入、激活插件或显式加载面板后启用 Client。当前“加载已信任面板”只启用浏览器侧，重启后公开方法的调用还需要 Host 已恢复。这是后续需要统一的装配入口。
+默认内置的 `morrow.settings` 插件提供“模型设置”页面和聊天模型选择器，复用相同注册和渲染入口；设置外壳没有固定模型页面。Node 的 `ctx.modelProfiles` 服务管理供应商、多个模型和凭据，支持查询、保存、删除和连接检测；插件保存当前会话的模型选择，网页配置即时用于后续请求，见[配置插件导读](model-settings-plugin.md)。
+
+历史浏览和外部插件执行分别管理。发送输入或调用 `resume` 会恢复外部 Host 插件；浏览器在发送输入、激活插件或显式加载面板后启用外部 Client。内置页面默认加载，首次调用内置 method 自动完成 Host 初始化，不要求先发送模型请求。当前“加载已信任面板”只启用浏览器侧，外部插件的公开方法仍要求其 Host 已恢复。
 
 组件渲染异常由局部错误边界显示，已经提交的 Host 状态继续保留。
 
@@ -338,7 +350,8 @@ MCP 适配在 [sdk/src/mcp.ts](../packages/sdk/src/mcp.ts) 中作为插件使用
 | 规划或多阶段 Agent 执行 | 自定义 Driver，使用已有 RunContext API |
 | 功能配置页、统计面板、消息展示 | Client 插件 + 公开 Host method |
 | 新业务状态或事件 | 命名空间状态 API / `plugin_event` |
-| 输入框扩展、侧栏按钮、工具栏等挂载位置 | 先扩展 Web 宿主插槽；目前只有 panel/page/renderer |
+| 聊天输入框工具栏控件 | Client 插件通过 `ctx.ui.composer()` 注册 |
+| 侧栏按钮等其他挂载位置 | 需要扩展 Web 宿主插槽；目前支持 panel/page/composer/renderer |
 | Web 按钮发起 Agent 执行 | 需要给 Client API 补提交任务桥接；当前 `invoke` 的 RunContext 没有活动 run |
 | 工具前后、回合前后的通用拦截 | 需要扩展宿主生命周期接口；当前 policy 聚焦请求准备 |
 | 事实结构、审批语义、并发与恢复规则变化 | Rust 内核与共享协议 |
@@ -347,7 +360,7 @@ MCP 适配在 [sdk/src/mcp.ts](../packages/sdk/src/mcp.ts) 中作为插件使用
 
 内置文件工具校验工作区路径，Shell 工具设置工作目录并经过审批；当前系统没有为所有插件和 Shell 建立操作系统级隔离沙箱。多个 Session 共享 Node 进程，一个导致进程退出的插件会影响该 Host 中的其他 Session。
 
-Web 保留原版布局，当前已接入外观、会话模型、插件管理等功能。旧版 MCP、Hooks 等配置页尚未全部迁移。后续增强应记录在单独设计文档中，并在实现后更新本导读。
+Web 保留原版布局，当前已接入外观、模型连接、插件管理等功能。旧版 MCP、Hooks 等配置页尚未全部迁移。后续增强应记录在单独设计文档中，并在实现后更新本导读。
 
 <a id="development"></a>
 
@@ -360,11 +373,12 @@ Web 保留原版布局，当前已接入外观、会话模型、插件管理等�
 ```bash
 cd vnext
 pnpm install --frozen-lockfile
+cargo build --bin morrow-kernel
 pnpm build
 export OPENAI_API_KEY='你的 API Key'
 export OPENAI_BASE_URL='https://api.deepseek.com/v1'
 export OPENAI_MODEL='deepseek-chat'
-cargo run --bin morrow-next -- --workspace .. serve --port 3001
+node packages/host/dist/launcher.js --workspace .. serve --port 3001
 ```
 
 打开终端打印的完整 `http://127.0.0.1:3001/#token=...` 地址。`--workspace` 指定 Agent 操作的项目，`--home` 可选择独立数据目录。新版使用这些参数和环境变量配置，不读取旧版 `morrow.toml`。
@@ -384,7 +398,7 @@ cargo run --bin morrow-next -- --workspace .. serve --port 3001
 
 | 命令或文件 | 验证的重点 |
 | --- | --- |
-| `cargo test --workspace` | 协议、投影、持久化、中断恢复与 SSE 等 Rust 行为 |
+| `cargo test --workspace` | 协议、投影、持久化、中断恢复与旧日志兼容 |
 | `cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings` | Rust 格式与 lint |
 | `pnpm check:types`、`pnpm typecheck` | Rust 生成的 TS 协议是否同步、应用类型检查 |
 | `pnpm test` | Cordis 生命周期、作用域、policy 与 MCP |
@@ -392,6 +406,6 @@ cargo run --bin morrow-next -- --workspace .. serve --port 3001
 | `pnpm test:browser` | 实际浏览器中的插件信任、面板、重连与错误边界 |
 | `scripts/package.mjs` | 打包 Rust、Node、Host、SDK、Cordis 与 Web 资源 |
 
-上述命令在 `vnext/` 执行。首次跑跨进程或浏览器测试前，先执行 `pnpm build` 和 `cargo build --bin morrow-next`；浏览器测试还需要安装 Playwright Chromium。协议变化后用 `pnpm types` 重新生成 [SDK 协议类型](../packages/sdk/src/protocol.ts)。
+上述命令在 `vnext/` 执行。首次跑跨进程或浏览器测试前，先执行 `pnpm build` 和 `cargo build --bin morrow-kernel`；浏览器测试还需要安装 Playwright Chromium。协议变化后用 `pnpm types` 重新生成 [SDK 协议类型](../packages/sdk/src/protocol.ts)。
 
 开始新增功能时，可以先复制 `examples/project-stats.*.mjs` 的双端组织方式，再决定需要哪些注册接口和状态字段。涉及执行与恢复规则的变化，应同时补充相应 Rust 或跨进程回归案例。

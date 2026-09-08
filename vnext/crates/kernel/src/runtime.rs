@@ -21,14 +21,12 @@ pub struct Session {
     pub store: Mutex<SessionStore>,
     pub cancel: Mutex<CancellationToken>,
     pub changed: Notify,
+    pub progress: Mutex<Option<(String, u64)>>,
 }
 
 pub struct Runtime {
     pub home: PathBuf,
     pub workspace: PathBuf,
-    pub model: String,
-    pub base_url: String,
-    pub api_key: String,
     pub sessions: Mutex<HashMap<String, Arc<Session>>>,
     pub peer: Mutex<Option<Arc<Peer>>>,
     pub ready: Notify,
@@ -53,16 +51,8 @@ impl Runtime {
         if let Some(session) = sessions.get(name) {
             return Ok(session.clone());
         }
-        let filename = if name == "_workspace" {
-            format!(
-                "workspace-{}",
-                digest(self.workspace.to_string_lossy().as_bytes())
-            )
-        } else {
-            name.into()
-        };
         let store = SessionStore::open(
-            &self.home.join("sessions").join(format!("{filename}.jsonl")),
+            &crate::sessions::path(&self.home, &self.workspace, name)?,
             &self.workspace,
             None,
         )?;
@@ -70,6 +60,7 @@ impl Runtime {
             store: Mutex::new(store),
             cancel: Mutex::new(CancellationToken::new()),
             changed: Notify::new(),
+            progress: Mutex::new(None),
         });
         sessions.insert(name.into(), session.clone());
         Ok(session)
@@ -233,7 +224,7 @@ impl Runtime {
             let workspace = self.snapshot("_workspace").await?;
             // The Host owns the agent loop; Rust retains authority over every
             // state-changing RPC that the loop makes while this run is active.
-            let task = peer.call("driver.run", json!({"session":name,"run":run,"epoch":peer.epoch,"snapshot":snapshot,"workspace":workspace,"model":self.model}));
+            let task = peer.call("driver.run", json!({"session":name,"run":run,"epoch":peer.epoch,"snapshot":snapshot,"workspace":workspace}));
             tokio::pin!(task);
             let (outcome, reason) = tokio::select! {
                 result = &mut task => match result { Ok(_) => (Outcome::Completed, String::new()), Err(e) => (Outcome::Failed, e.to_string()) },
@@ -320,6 +311,37 @@ impl Runtime {
         }
         let (name, session) = self.validate_handle(peer, &params).await?;
         match method {
+            "model.progress" => {
+                let request = string(&params, "request")?;
+                let store = session.store.lock().await;
+                store.projection.require_step(string(&params, "step")?)?;
+                ensure!(
+                    store
+                        .projection
+                        .effects
+                        .get(request)
+                        .is_some_and(|e| e.kind == "model" && e.outcome.is_none()),
+                    "inactive model progress"
+                );
+                let sequence = params["sequence"]
+                    .as_u64()
+                    .context("missing progress sequence")?;
+                let mut last = session.progress.lock().await;
+                if last
+                    .as_ref()
+                    .is_some_and(|(id, seq)| id == request && *seq >= sequence)
+                {
+                    return Ok(Value::Null);
+                }
+                ensure!(
+                    serde_json::to_vec(&params["events"])?.len() <= 65_536,
+                    "progress batch too large"
+                );
+                *last = Some((request.into(), sequence));
+                let purpose = &store.projection.requests[request].purpose;
+                let _ = self.events.send(json!({"type":"model_progress","session":name,"run":params["run"],"step":params["step"],"request":request,"sequence":sequence,"purpose":purpose,"events":params["events"]}));
+                Ok(Value::Null)
+            }
             "session.get" => Ok(json!(session.store.lock().await.projection)),
             "workspace.get" => Ok(json!(self.snapshot("_workspace").await?)),
             "step.begin" => {
@@ -445,7 +467,7 @@ impl Runtime {
                     parent = self.snapshot(&name).await?.parent;
                 }
                 let store = SessionStore::open(
-                    &self.home.join("sessions").join(format!("{child}.jsonl")),
+                    &crate::sessions::path(&self.home, &self.workspace, &child)?,
                     &self.workspace,
                     Some(name.clone()),
                 )?;
@@ -453,6 +475,7 @@ impl Runtime {
                     store: Mutex::new(store),
                     cancel: Mutex::new(CancellationToken::new()),
                     changed: Notify::new(),
+                    progress: Mutex::new(None),
                 });
                 self.sessions
                     .lock()
@@ -525,6 +548,84 @@ impl Runtime {
             }
             _ => bail!("unknown host method {method}"),
         }
+    }
+
+    pub async fn migrate(&self, source: &str, target: &str) -> Result<Value> {
+        valid_id(target)?;
+        let workspace = source == "_workspace" && target == "_workspace";
+        ensure!(
+            workspace || (target != "_workspace" && source != target),
+            "choose a new session id"
+        );
+        let session = self.session(source).await?;
+        let mut source_store = session.store.lock().await;
+        let legacy = source_store
+            .legacy
+            .as_mut()
+            .context("source is not a v1 session")?;
+        let last = legacy.records.last().context("empty legacy log")?;
+        let (seq, hash) = (last.seq, last.hash.clone());
+        legacy.recover_for_import()?;
+        let state = legacy.normalized()?;
+        let destination = if workspace {
+            self.home.join("sessions").join(format!(
+                "workspace-v2-{}.jsonl",
+                digest(self.workspace.to_string_lossy().as_bytes())
+            ))
+        } else {
+            crate::sessions::path(&self.home, &self.workspace, target)?
+        };
+        ensure!(!destination.exists(), "target session already exists");
+        let directory = destination.parent().context("missing session directory")?;
+        std::fs::create_dir_all(directory)?;
+        let temporary = directory.join(format!("migration-{}.tmp", id()));
+        let result = (|| -> Result<()> {
+            let mut store = SessionStore::open(&temporary, &self.workspace, state.parent.clone())?;
+            store.commit(Fact::SessionImported {
+                source: source.into(),
+                seq,
+                hash,
+                nodes: state.nodes,
+                surface: state.surface,
+            })?;
+            for version in state.plugins.into_values() {
+                store.commit(Fact::PluginDefined { version })?;
+            }
+            for hash in state.trusted {
+                store.commit(Fact::PluginTrusted { hash })?;
+            }
+            for (name, binding) in state.bindings {
+                store.commit(Fact::PluginBound {
+                    name,
+                    hash: binding.hash,
+                    active: binding.active,
+                })?;
+            }
+            for (namespace, entries) in state.plugin_state {
+                for (key, value) in entries {
+                    store.commit(Fact::PluginStateSet {
+                        namespace: namespace.clone(),
+                        key,
+                        value,
+                    })?;
+                }
+            }
+            drop(store);
+            let check = SessionStore::open(&temporary, &self.workspace, None)?;
+            drop(check);
+            // hard_link installs without overwriting an existing destination.
+            std::fs::hard_link(&temporary, &destination)?;
+            #[cfg(unix)]
+            std::fs::File::open(directory)?.sync_all()?;
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&temporary);
+        result?;
+        drop(source_store);
+        if workspace {
+            self.sessions.lock().await.remove("_workspace");
+        }
+        Ok(json!({"session":target,"source":source}))
     }
 
     pub async fn define(&self, name: &str, manifest: PluginManifest) -> Result<Value> {

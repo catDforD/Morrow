@@ -36,9 +36,29 @@ fn start(store: &mut SessionStore) {
         .commit(Fact::StepStarted {
             run: "run".into(),
             step: "step".into(),
-            registrations: vec![],
+            registrations: vec![registration()],
         })
         .unwrap();
+}
+fn registration() -> Registration {
+    Registration {
+        kind: "model".into(),
+        name: "script".into(),
+        plugin: "test".into(),
+        version: "1".into(),
+        scope: "session".into(),
+        epoch: "epoch".into(),
+        generation: 0,
+        tool: None,
+    }
+}
+fn result(message: Message) -> ModelResult {
+    ModelResult {
+        message,
+        continuation: None,
+        usage: serde_json::Value::Null,
+        finish_reason: "stop".into(),
+    }
 }
 fn prepared(store: &mut SessionStore, id: &str) -> PreparedRequest {
     let mut request = PreparedRequest {
@@ -50,16 +70,27 @@ fn prepared(store: &mut SessionStore, id: &str) -> PreparedRequest {
         surface: store.projection.surface.clone(),
         temporary: vec![Message::text(Role::User, "temporary context")],
         header: RequestHeader {
+            profile: None,
             provider: "script".into(),
             model: "test".into(),
             system: "effective header".into(),
             tools: vec![],
             parameters: json!({"temperature":0}),
         },
-        registrations: vec![],
-        body: json!({}),
+        registrations: vec![registration()],
+        plan: None,
+        retry_of: None,
     };
-    request.body = store.projection.reconstruct(&request).unwrap();
+    store
+        .commit(Fact::ModelRequested {
+            request: request.clone(),
+        })
+        .unwrap();
+    request.plan = Some(PreparedPlan {
+        profile: None,
+        format: "test.v1".into(),
+        payload: store.projection.reconstruct(&request).unwrap(),
+    });
     store
         .commit(Fact::RequestPrepared {
             request: request.clone(),
@@ -83,13 +114,13 @@ fn model(store: &mut SessionStore, message: Message) {
         .commit(Fact::EffectSettled {
             id: "request".into(),
             outcome: Outcome::Completed,
-            output: json!(message),
+            output: json!(result(message.clone())),
         })
         .unwrap();
     store
         .commit(Fact::ModelSettled {
             request: "request".into(),
-            message: Some(message),
+            result: Some(result(message)),
             error: None,
         })
         .unwrap();
@@ -136,9 +167,12 @@ fn incremental_projection_equals_replay_and_prepared_input_is_reconstructible() 
     let request = &session.projection.requests["request"];
     assert_eq!(
         session.projection.reconstruct(request).unwrap(),
-        request.body
+        request.plan.as_ref().unwrap().payload
     );
-    assert_eq!(request.body["messages"][2]["content"], "temporary context");
+    assert_eq!(
+        request.plan.as_ref().unwrap().payload["messages"][1]["content"],
+        "temporary context"
+    );
 }
 
 #[test]
@@ -218,6 +252,125 @@ fn recovery_distinguishes_prepared_from_started_and_never_repeats_effects() {
         drop(session);
         assert_eq!(store(&directory).projection.seq, seq);
     }
+}
+
+#[test]
+fn recovery_restores_continuation_with_message_and_compaction_excludes_it() {
+    let directory = Directory::new();
+    let mut session = store(&directory);
+    start(&mut session);
+    prepared(&mut session, "r");
+    let result = ModelResult {
+        message: Message::text(Role::Assistant, "hello"),
+        continuation: Some(Continuation {
+            provider: "script".into(),
+            format: "opaque.v1".into(),
+            data: json!({"items":["preserve"]}),
+        }),
+        usage: json!({}),
+        finish_reason: "stop".into(),
+    };
+    session
+        .commit(Fact::EffectStarted {
+            id: "r".into(),
+            run: "run".into(),
+            step: "step".into(),
+            kind: "model".into(),
+            name: "script".into(),
+            input: json!({}),
+        })
+        .unwrap();
+    session
+        .commit(Fact::EffectSettled {
+            id: "r".into(),
+            outcome: Outcome::Completed,
+            output: json!(result),
+        })
+        .unwrap();
+    drop(session);
+    let mut session = store(&directory);
+    assert_eq!(
+        session.projection.nodes["r"].continuation,
+        result.continuation
+    );
+    let mut request = session.projection.requests["r"].clone();
+    request.surface = session.projection.surface.clone();
+    assert_eq!(
+        session.projection.reconstruct(&request).unwrap()["continuations"][1]["data"]["items"][0],
+        "preserve"
+    );
+    let covers = session
+        .projection
+        .replacement_covers("input:input", "r")
+        .unwrap();
+    session
+        .commit(Fact::SurfaceReplaced {
+            revision: session.projection.revision,
+            start: "input:input".into(),
+            end: "r".into(),
+            id: "summary".into(),
+            message: Message::text(Role::User, "summary"),
+            covers,
+            source_request: None,
+        })
+        .unwrap();
+    request.surface = session.projection.surface.clone();
+    assert_eq!(
+        session.projection.reconstruct(&request).unwrap()["continuations"],
+        json!([null, null])
+    );
+    assert!(session.projection.nodes["r"].continuation.is_some());
+}
+
+#[test]
+fn requested_only_recovers_and_changed_preparation_is_rejected() {
+    let directory = Directory::new();
+    let mut session = store(&directory);
+    start(&mut session);
+    let mut request = PreparedRequest {
+        id: "r".into(),
+        run: "run".into(),
+        step: "step".into(),
+        purpose: "main".into(),
+        revision: session.projection.revision,
+        surface: session.projection.surface.clone(),
+        temporary: vec![],
+        header: RequestHeader {
+            profile: None,
+            provider: "script".into(),
+            model: "m".into(),
+            system: String::new(),
+            tools: vec![],
+            parameters: json!({"new_protocol_option":true}),
+        },
+        registrations: vec![registration()],
+        plan: None,
+        retry_of: None,
+    };
+    session
+        .commit(Fact::ModelRequested {
+            request: request.clone(),
+        })
+        .unwrap();
+    assert!(
+        session
+            .commit(Fact::ModelRequested {
+                request: request.clone()
+            })
+            .is_err()
+    );
+    request.header.model = "changed".into();
+    request.plan = Some(PreparedPlan {
+        profile: None,
+        format: "test".into(),
+        payload: json!({}),
+    });
+    assert!(session.commit(Fact::RequestPrepared { request }).is_err());
+    drop(session);
+    let session = store(&directory);
+    assert!(session.projection.settled_requests.contains("r"));
+    assert!(session.projection.effects.is_empty());
+    assert!(session.projection.run.is_none());
 }
 
 #[test]

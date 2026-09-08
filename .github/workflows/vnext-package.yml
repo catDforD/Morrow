@@ -22,7 +22,7 @@ jobs:
           version: 10.30.3
       - run: pnpm install --frozen-lockfile
         working-directory: vnext
-      - run: cargo test --workspace && cargo build --release --bin morrow-next
+      - run: cargo test --workspace && cargo build --bin morrow-kernel && cargo build --release --bin morrow-kernel
         working-directory: vnext
       - run: pnpm build && pnpm typecheck && pnpm test && node scripts/package.mjs && node tests/package-smoke.mjs
         working-directory: vnext

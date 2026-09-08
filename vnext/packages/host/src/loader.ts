@@ -1,11 +1,14 @@
-import { Context, Contributions, Morrow, RunContext } from '@morrow/sdk'
+import { Context, Contributions, Morrow, ModelProfiles, RunContext } from '@morrow/sdk'
 import type { Entry, Owner, PluginVersion, Projection, Rpc, Registration } from '@morrow/sdk'
 import type { Fiber, Plugin } from '@deepseek-ai/cordis'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import { pathToFileURL } from 'node:url'
-import { agent, builtin, settings } from './defaults.js'
+import { agent, builtin } from './defaults.js'
+import { builtinPlugins } from './builtins/index.js'
+import { ProviderService, Profiles } from './provider-service.js'
+import { chatProvider, responsesProvider } from './providers.js'
 
 interface Loaded { hash: string; fiber: Fiber }
 interface SessionHost {
@@ -16,24 +19,42 @@ interface SessionHost {
 }
 
 export class Host {
+  readonly providers: ProviderService
   private sessions = new Map<string, SessionHost>()
+  private initializing = new Map<string, Promise<SessionHost>>()
   private runs = new Map<string, AbortController>()
-  constructor(readonly rpc: Rpc, readonly epoch: string, readonly home: string) {}
+  constructor(readonly rpc: Rpc, readonly epoch: string, readonly home: string, readonly profiles: Profiles) { this.providers = new ProviderService(profiles) }
   async session(name: string): Promise<SessionHost> {
-    let session = this.sessions.get(name)
-    if (session) return session
+    const ready = this.sessions.get(name)
+    if (ready) return ready
+    const pending = this.initializing.get(name)
+    if (pending) return pending
+    const creating = this.createSession(name)
+    this.initializing.set(name, creating)
+    try {
+      const session = await creating
+      this.sessions.set(name, session)
+      return session
+    } finally { this.initializing.delete(name) }
+  }
+  private async createSession(name: string): Promise<SessionHost> {
     const ctx = new Context()
     const contributions = new Contributions()
     new Morrow(ctx, contributions)
+    new ModelProfiles(ctx, this.profiles)
     const workspace = ctx.extend({ [Context.isolate]: Object.create(ctx[Context.isolate]) })
     const local = workspace.extend({ [Context.isolate]: Object.create(workspace[Context.isolate]) })
-    session = { ctx, contributions, loaded: new Map(), generation: 0, sync: Promise.resolve(), scopes: ['application', 'workspace', `session:${name}`], pending: false,
+    const session: SessionHost = { ctx, contributions, loaded: new Map(), generation: 0, sync: Promise.resolve(), scopes: ['application', 'workspace', `session:${name}`], pending: false,
       contexts: new Map([['workspace', workspace], [`session:${name}`, local]]) }
-    this.sessions.set(name, session)
     const owner = { plugin: 'morrow.builtin', version: '1', scope: 'application', epoch: this.epoch, generation: 0 }
     await ctx.extend({ morrowOwner: owner }).plugin(builtin)
     await ctx.extend({ morrowOwner: { ...owner, plugin: 'morrow.agent' } }).plugin(agent)
-    await ctx.extend({ morrowOwner: { ...owner, plugin: 'morrow.settings' } }).plugin(settings)
+    for (const entry of builtinPlugins) await ctx.extend({ morrowOwner: { ...owner, plugin: entry.name, version: entry.version } }).plugin(entry.plugin)
+    await ctx.extend({ morrowOwner: { ...owner, plugin: 'morrow.providers', version: 'provider-v2-1' } }).plugin(ctx => {
+      ctx.morrow.provider('openai-chat', chatProvider)
+      ctx.morrow.provider('openai-responses', responsesProvider)
+      ctx.morrow.provider('openai', chatProvider)
+    })
     return session
   }
   private async source(version: PluginVersion): Promise<Plugin> {
@@ -114,18 +135,20 @@ export class Host {
     const state = await this.rpc.call<Projection>('session.get', { session: name, epoch: this.epoch })
     await this.sync(name, state, await this.workspace(name))
   }
-  async run(params: { session: string; run: string; snapshot: Projection; workspace: Projection; model: string }) {
+  async run(params: { session: string; run: string; snapshot: Projection; workspace: Projection }) {
     const session = await this.session(params.session)
     if (session.current) throw new Error('session already running')
     const abort = new AbortController()
     this.runs.set(params.run, abort)
-    const run = new RunContext(this.rpc, params.session, params.run, this.epoch, abort.signal, params.model, {
+    const profile = this.profiles.defaultId ? this.profiles.public(this.profiles.defaultId) : { provider: 'openai-chat', model: '' }
+    const run = new RunContext(this.rpc, params.session, params.run, this.epoch, abort.signal, profile.model, {
       begin: async () => {
         await this.sync(params.session, await run.snapshot(), await this.workspace(params.session))
         return session.contributions.snapshot(session.scopes)
       },
       end: async () => {},
     })
+    run.defaults = { provider: profile.provider, model: profile.model, system: '', tools: [], parameters: {} }
     session.current = run
     try {
       await this.sync(params.session, params.snapshot, params.workspace)
@@ -139,11 +162,23 @@ export class Host {
       session.current = undefined
       session.driver = undefined
       this.runs.delete(params.run)
+      this.providers.release(params.run)
       abort.abort()
       if (session.pending) await this.changed(params.session)
     }
   }
   cancel(run: string) { this.runs.get(run)?.abort() }
+  cancelAll() { for (const abort of this.runs.values()) abort.abort() }
+  async dispose() { this.cancelAll(); await Promise.all([...this.sessions.values()].map(s => s.ctx.fiber.dispose())) }
+  async provider(phase: 'prepare' | 'execute', params: any) {
+    const session = this.sessions.get(params.context.session)
+    const run = session?.current
+    if (!run || run.run !== params.context.run || run.step !== params.context.step) throw new Error('stale provider handle')
+    const entry = run.entries.find(e => isDeepStrictEqual(e.registration, params.registration))
+    if (!entry || entry.registration.kind !== 'model') throw new Error('stale provider registration')
+    run.signal.throwIfAborted()
+    return phase === 'prepare' ? this.providers.prepare(entry, run, params.request, params.input) : this.providers.execute(entry, run, params.request)
+  }
   async invoke(registration: Registration, handle: { session: string; run: string; step: string }, input: unknown) {
     const session = this.sessions.get(handle.session)
     const run = session?.current
@@ -154,8 +189,7 @@ export class Host {
     return entry.handler(input, run.forOwner(registration, entry.signal))
   }
   async client(params: { session: string; plugin: string; hash: string; method: string; input: unknown }) {
-    const session = this.sessions.get(params.session)
-    if (!session) throw new Error('resume execution to start this plugin host')
+    const session = await this.session(params.session)
     const entries = session.contributions.snapshot(session.scopes)
     const entry = entries.find(e => e.registration.kind === 'method' && e.registration.name === params.method && e.registration.plugin === params.plugin && e.registration.version === params.hash)
     if (!entry) throw new Error('public scoped method unavailable')

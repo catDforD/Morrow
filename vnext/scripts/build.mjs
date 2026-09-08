@@ -12,4 +12,5 @@ for (const name of ['cosmokit', 'cordis']) {
 }
 await build({ entryPoints: ['packages/sdk/src/index.ts'], outfile: 'packages/sdk/dist/index.js', bundle: true, format: 'esm', platform: 'node', packages: 'external', sourcemap: true })
 await build({ entryPoints: ['packages/host/src/index.ts'], outfile: 'packages/host/dist/index.js', bundle: true, format: 'esm', platform: 'node', packages: 'external', sourcemap: true })
+for (const name of ['launcher', 'providers', 'provider-service']) await build({ entryPoints: [`packages/host/src/${name}.ts`], outfile: `packages/host/dist/${name}.js`, bundle: true, format: 'esm', platform: 'node', packages: 'external', sourcemap: true })
 await vite({ root: resolve('packages/web'), plugins: [tailwindcss()], build: { outDir: 'dist', rollupOptions: { preserveEntrySignatures: 'strict', input: { main: resolve('packages/web/index.html'), react: resolve('packages/web/src/react.ts'), cordis: resolve('packages/web/src/cordis.ts') }, output: { entryFileNames: '[name].js' } } } })

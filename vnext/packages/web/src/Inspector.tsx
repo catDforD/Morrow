@@ -33,7 +33,7 @@ export function Inspector({ session, state, records, views, tab, onTab, onClose,
             const fact = record.fact
             if (fact.type === 'request_prepared') void api(`${base(session)}/request/${fact.request.id}`).then(setRequest).catch(error => report(String(error)))
           }}>重建模型请求</button>}</details>)}
-          {request !== undefined && <section className="fact-record"><h3>模型请求</h3><pre data-testid="reconstructed-request">{JSON.stringify(request, null, 2)}</pre></section>}
+          {request !== undefined && <section className="fact-record"><h3>模型请求</h3><p>统一输入可从会话重建。Provider 准备记录保留协议转换结果，认证信息省略。</p><pre data-testid="reconstructed-request">{JSON.stringify(request, null, 2)}</pre></section>}
         </>}
         {tab === 'panels' && <>
           {!enabled && <button className="secondary-button" onClick={onEnable}>加载已信任面板</button>}

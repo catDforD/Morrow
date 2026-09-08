@@ -1,37 +1,35 @@
 import { useRef, useState, type ReactNode } from 'react'
-import { ArrowLeft, Bot, Info, Moon, PanelLeft, Puzzle, Settings2, Sun, X } from 'lucide-react'
+import { ArrowLeft, Info, Moon, PanelLeft, Puzzle, Settings2, Sun, X } from 'lucide-react'
 import type { Projection } from '@morrow/sdk'
-import { action } from './api.js'
 import { MiniIconButton } from './IconButton.js'
 import { useDialogFocus } from './useDialogFocus.js'
-import { PluginView, type ClientView } from './plugins.js'
+import { PluginView, pageSection, type ClientView } from './plugins.js'
 
-export type SettingsSection = 'general' | 'models' | 'plugins' | 'about' | `page:${string}`
+export type SettingsSection = 'general' | 'plugins' | 'about' | `page:${string}`
 const sections = [
-  { id: 'general', label: '常规', icon: <Settings2 size={18} /> },
-  { id: 'models', label: '模型设置', icon: <Bot size={18} /> },
-  { id: 'plugins', label: '插件', icon: <Puzzle size={18} /> },
-  { id: 'about', label: '关于', icon: <Info size={18} /> },
+  { id: 'general', order: 10, label: '常规', icon: <Settings2 size={18} /> },
+  { id: 'plugins', order: 90, label: '插件', icon: <Puzzle size={18} /> },
+  { id: 'about', order: 100, label: '关于', icon: <Info size={18} /> },
 ] as const
 
-export function Settings({ session, state, workspace, section, onSection, theme, onTheme, sidebarOpen, onSidebar, onBack, report, perform, enableClients, views, onSaved }: {
+export function Settings({ session, state, workspace, section, onSection, theme, onTheme, sidebarOpen, onSidebar, onBack, report, perform, enableClients, views }: {
   session: string; state: Projection; workspace: Projection; section: SettingsSection; onSection(value: SettingsSection): void
   theme: 'light' | 'dark'; onTheme(): void; sidebarOpen: boolean; onSidebar(open: boolean): void; onBack(): void
-  report(error: string): void; perform(name: string, values?: object): Promise<boolean>; enableClients(): void; views: ClientView[]; onSaved(): Promise<void>
+  report(error: string): void; perform(name: string, values?: object): Promise<boolean>; enableClients(): void; views: ClientView[]
 }) {
   const sidebar = useRef<HTMLElement>(null)
   useDialogFocus(sidebar, sidebarOpen ? 'settings' : null)
   const pages = views.filter(view => view.kind === 'page')
   const selectedPage = pages.find(view => `page:${view.plugin}:${view.name}` === section)
-  const title = sections.find(item => item.id === section)?.label ?? selectedPage?.name ?? '插件页面'
+  const tabs = [...sections, ...pages.map(view => ({ id: pageSection(view), label: view.name, icon: view.icon ?? <Puzzle size={18} />, order: view.order ?? 50 }))].sort((a, b) => a.order - b.order)
+  const title = tabs.find(item => item.id === section)?.label ?? '插件页面'
   return <div className={`app-frame settings-frame${sidebarOpen ? ' sidebar-open' : ''}`}>
     <button className="mobile-sidebar-backdrop" type="button" aria-label="关闭设置导航" aria-hidden={!sidebarOpen} tabIndex={sidebarOpen ? 0 : -1} onClick={() => onSidebar(false)} />
     <aside id="settings-navigation" ref={sidebar} tabIndex={-1} className="app-sidebar settings-sidebar" aria-label="设置导航" inert={!sidebarOpen && window.matchMedia('(max-width: 900px)').matches}>
       <div className="sidebar-brand"><div className="brand-mark">M</div><div className="sidebar-brand-copy"><strong>Morrow</strong><span>设置</span></div><MiniIconButton title="关闭设置导航" onClick={() => onSidebar(false)}><X size={17} /></MiniIconButton></div>
       <button className="settings-back-button" type="button" onClick={onBack}><ArrowLeft size={18} /><span>返回工作区</span></button>
       <nav className="settings-navigation main-scroll" aria-label="设置分类">
-        {sections.map(item => <button className={`settings-nav-item${section === item.id ? ' active' : ''}`} type="button" key={item.id} aria-current={section === item.id ? 'page' : undefined} onClick={() => onSection(item.id)}>{item.icon}<span>{item.label}</span></button>)}
-        {pages.map(view => <button className={`settings-nav-item${selectedPage === view ? ' active' : ''}`} type="button" key={`${view.plugin}:${view.name}`} onClick={() => onSection(`page:${view.plugin}:${view.name}`)}><Puzzle size={18} /><span>{view.name}</span></button>)}
+        {tabs.map(item => <button className={`settings-nav-item${section === item.id ? ' active' : ''}`} type="button" key={item.id} aria-current={section === item.id ? 'page' : undefined} onClick={() => onSection(item.id)}>{item.icon}<span>{item.label}</span></button>)}
       </nav>
       <div className="settings-sidebar-footer"><span>当前会话</span><strong>{session}</strong></div>
     </aside>
@@ -40,10 +38,9 @@ export function Settings({ session, state, workspace, section, onSection, theme,
       <div className="settings-scroll main-scroll"><div className="settings-page">
         <header className="settings-page-header"><h1>{title}</h1></header>
         {section === 'general' && <section className="settings-card"><div className="settings-row"><span className="settings-row-icon">{theme === 'dark' ? <Moon size={18} /> : <Sun size={18} />}</span><div className="settings-row-copy"><strong>外观</strong></div><button className="secondary-button" onClick={onTheme}>{theme === 'dark' ? '深色' : '浅色'} · 切换主题</button></div><InfoRow label="工作区">{state.workspace}</InfoRow><InfoRow label="操作权限">写入文件与 Shell 命令需要确认</InfoRow></section>}
-        {section === 'models' && <ModelSettings session={session} state={state} report={report} onSaved={onSaved} />}
         {section === 'plugins' && <PluginSettings state={state} workspace={workspace} perform={perform} enableClients={enableClients} report={report} />}
         {section === 'about' && <section className="settings-card"><InfoRow label="应用">Morrow</InfoRow><InfoRow label="会话">{session}</InfoRow><InfoRow label="核心">事实日志与 Cordis 插件</InfoRow></section>}
-        {selectedPage && <PluginView view={selectedPage} session={session} state={state} />}
+        {selectedPage && <PluginView key={`${selectedPage.plugin}:${selectedPage.name}`} view={selectedPage} session={session} state={state} />}
       </div></div>
     </main>
   </div>
@@ -51,35 +48,6 @@ export function Settings({ session, state, workspace, section, onSection, theme,
 
 function InfoRow({ label, children }: { label: string; children: ReactNode }) {
   return <dl className="settings-info-row"><dt>{label}</dt><dd>{children}</dd></dl>
-}
-
-type ModelConfig = { model?: string; provider?: string; system?: string; parameters?: object }
-function ModelSettings({ session, state, report, onSaved }: { session: string; state: Projection; report(error: string): void; onSaved(): Promise<void> }) {
-  const initial = (state.plugin_state['morrow.settings']?.model ?? {}) as ModelConfig
-  const [model, setModel] = useState(initial.model ?? '')
-  const [provider, setProvider] = useState(initial.provider ?? '')
-  const [system, setSystem] = useState(initial.system ?? '')
-  const [parameters, setParameters] = useState(JSON.stringify(initial.parameters ?? {}, null, 2))
-  const [busy, setBusy] = useState(false)
-  const [saved, setSaved] = useState(false)
-  return <form className="settings-card extension-form" onChange={() => setSaved(false)} onSubmit={event => {
-    event.preventDefault()
-    setBusy(true)
-    void (async () => {
-      const options = JSON.parse(parameters)
-      if (!options || Array.isArray(options) || typeof options !== 'object') throw new Error('请求参数必须是 JSON 对象')
-      await action(session, 'resume')
-      await action(session, 'invoke', { plugin: 'morrow.settings', hash: '1', method: 'settings.set', input: { model: model.trim(), provider: provider.trim(), system, parameters: options } })
-      await onSaved()
-      setSaved(true)
-    })().catch(error => report(String(error))).finally(() => setBusy(false))
-  }}>
-    <p className="muted-line">设置用于当前会话的后续请求。模型留空时沿用启动配置。</p>
-    <div className="provider-field-grid"><label><span>模型</span><input aria-label="模型" value={model} placeholder="沿用启动时配置" onChange={event => setModel(event.target.value)} /></label><label><span>Provider</span><input aria-label="Provider" value={provider} placeholder="沿用当前模型插件" onChange={event => setProvider(event.target.value)} /></label></div>
-    <label className="extension-field">补充系统提示<textarea value={system} onChange={event => setSystem(event.target.value)} rows={5} /></label>
-    <details><summary>请求参数</summary><label className="extension-field">JSON 参数<textarea aria-label="请求参数" value={parameters} onChange={event => setParameters(event.target.value)} rows={5} /></label></details>
-    <div className="extension-actions"><button className="approve-button" disabled={busy}>{busy ? '保存中…' : '保存设置'}</button>{saved && <span role="status">已保存</span>}</div>
-  </form>
 }
 
 function PluginSettings({ state, workspace, perform, enableClients, report }: { state: Projection; workspace: Projection; perform(name: string, values?: object): Promise<boolean>; enableClients(): void; report(error: string): void }) {

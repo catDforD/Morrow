@@ -12,8 +12,9 @@ export async function environment() {
   return { directory, home, workspace, async dispose() { await rm(directory, { recursive: true, force: true }) } }
 }
 export async function start(env) {
-  const binary = env.binary ?? resolve(root, `target/debug/morrow-next${process.platform === 'win32' ? '.exe' : ''}`)
-  const child = spawn(binary, ['--home', env.home, '--workspace', env.workspace, ...(env.binary ? [] : ['--resources', root]), 'serve', '--port', '0'], { cwd: env.workspace, stdio: ['ignore', 'pipe', 'pipe'] })
+  const launcher = env.launcher ?? resolve(root, 'packages/host/dist/launcher.js')
+  const command = env.command ?? [env.node ?? process.execPath, launcher, '--home', env.home, '--workspace', env.workspace, ...(env.launcher ? [] : ['--resources', root]), 'serve', '--port', '0']
+  const child = spawn(command[0], command.slice(1), { cwd: env.workspace, env: env.environment ?? process.env, stdio: ['ignore', 'pipe', 'pipe'] })
   let errors = '', output = ''
   child.stderr.on('data', data => { errors += data.toString() })
   const ready = await new Promise((resolve, reject) => {

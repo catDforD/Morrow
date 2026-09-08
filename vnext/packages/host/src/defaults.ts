@@ -19,16 +19,17 @@ export function agent(ctx: Context) {
       run.signal.throwIfAborted()
       await run.beginStep()
       const preparation = await run.prepare({ header: {
-        provider: 'openai', model: run.modelName, system: '', tools: run.tools, parameters: {},
+        provider: 'openai-chat', model: run.modelName, system: '', parameters: {}, ...run.defaults, tools: run.tools,
       }, temporary: [] })
       let message: Message
       try { message = await run.model(preparation.header, { temporary: preparation.temporary }) }
       catch (error) {
         // A bounded context retry must first replace a real, balanced range.
-        if (!/context.{0,30}(length|limit|window)|maximum context/i.test(String(error))) throw error
+        if ((error as { code?: string }).code !== 'context_length') throw error
+        const retry_of = run.lastRequest!
         const changed = await compact(run, preparation.header, 2)
         if (!changed) throw error
-        message = await run.model(preparation.header, { temporary: preparation.temporary })
+        message = await run.model(preparation.header, { temporary: preparation.temporary, retry_of })
       }
       await Promise.all(message.tool_calls.map(async call => {
         let output: unknown
@@ -54,19 +55,6 @@ export function agent(ctx: Context) {
   ctx.morrow.tool({ name: 'plugin_define', description: 'Define an immutable session plugin. Returns a version hash for user review/trust; does not execute its source. Host ESM exports default Cordis plugin(ctx) and uses ctx.morrow.tool/model/driver/policy/method. Client exports default(ctx) and uses ctx.ui.panel/page/renderer. No dependencies: set dependency_lock to "{}"; otherwise supply a prebundled artifact and its lock.', parameters: parameters({ name: { type: 'string' }, description: { type: 'string' }, host: { type: 'string' }, client: { type: ['string', 'null'] }, dependency_lock: { type: 'string' } }, ['name', 'description', 'host', 'dependency_lock']), approval: false }, (input, run) => run.define({ ...input, client: input.client ?? null }))
   ctx.morrow.tool({ name: 'plugin_activate', description: 'Activate a trusted session plugin version at the next step boundary.', parameters: parameters({ hash: { type: 'string' } }, ['hash']), approval: false }, (input, run) => run.activate(input.hash))
   ctx.morrow.tool({ name: 'subagent', description: 'Run an isolated child agent with inherited trusted bindings. The child cannot mutate the parent session.', parameters: parameters({ prompt: { type: 'string' } }, ['prompt']), approval: false }, (input, run) => run.subagent(input.prompt))
-}
-
-export function settings(ctx: Context) {
-  ctx.morrow.policy('20-settings', async (run, preparation, next) => {
-    const config = await run.state<{ model?: string; provider?: string; system?: string; parameters?: RequestHeader['parameters'] }>('model')
-    if (config?.model) preparation.header.model = config.model
-    if (config?.provider) preparation.header.provider = config.provider
-    if (config?.system) preparation.header.system += `\n${config.system}`
-    if (config?.parameters) preparation.header.parameters = config.parameters
-    await next()
-  })
-  ctx.morrow.method('settings.get', (_input, run) => run.state('model'))
-  ctx.morrow.method('settings.set', (input, run) => run.setState('model', input))
 }
 
 export async function compact(run: RunContext, header: RequestHeader, keep: number): Promise<boolean> {

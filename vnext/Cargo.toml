@@ -11,7 +11,6 @@ anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -20,4 +19,3 @@ tokio-util = "0.7"
 tower-http = { version = "0.6", features = ["fs"] }
 ts-rs = { version = "11", features = ["serde-json-impl"] }
 uuid = { version = "1", features = ["v4"] }
-

@@ -5,6 +5,8 @@
 | 文档 | 用途 |
 | --- | --- |
 | [新版 Agent 架构导读](architecture.md) | 新入手时理解模块关系、一次执行、事实溯源、上下文和插件扩展 |
+| [Provider 与 Rust 内核解耦](provider-isolation.md) | 已实现的协议与凭据隔离、准备/执行边界、Responses 支持及设计取舍 |
+| [模型设置插件](model-settings-plugin.md) | 默认内置页面、共享连接配置服务、即时生效与插件扩展接口 |
 | [架构图源与图片](diagrams/) | Mermaid `.mmd` 图源及对应的 SVG 预览 |
 
 后续文档按主题命名，例如 `context-management.md`、`plugin-lifecycle.md`。已实现的行为应给出源码入口；提案应明确标记为“设计提案”，记录解决的问题、取舍和落地状态。架构变化时同步更新导读与相应图源。

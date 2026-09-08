@@ -27,9 +27,10 @@ export function HomePrompt({ workspace, onPickHint, children }: { workspace: str
   </div>
 }
 
-export function Composer({ prompt, onPromptChange, onSubmit, onCancel, running, busy, enabled, workspace, model, home, onManageModels }: {
+export function Composer({ prompt, onPromptChange, onSubmit, onCancel, running, busy, enabled, workspace, model, home, onManageModels, actions }: {
   prompt: string; onPromptChange(value: string): void; onSubmit(): void; onCancel(): void
   running: boolean; busy: boolean; enabled: boolean; workspace: string; model: string; home: boolean; onManageModels(): void
+  actions?: ReactNode
 }) {
   const textarea = useRef<HTMLTextAreaElement>(null)
   useLayoutEffect(() => {
@@ -48,7 +49,7 @@ export function Composer({ prompt, onPromptChange, onSubmit, onCancel, running, 
       <div className="composer-bar"><div className="composer-left">
         <span className="permission-trigger permission-indicator" title="读取文件直接执行，写入文件和 Shell 命令需要确认"><Shield size={15} /><span className="permission-trigger-label">操作需确认</span></span>
       </div><div className="composer-primary">
-        <button className="composer-chip labeled model-trigger" type="button" title="配置模型" onClick={onManageModels}><Bot size={15} /><span>{model || '配置模型'}</span><ChevronDown size={14} /></button>
+        {actions ?? <button className="composer-chip labeled model-trigger" type="button" title="配置模型" onClick={onManageModels}><Bot size={15} /><span>{model || '配置模型'}</span><ChevronDown size={14} /></button>}
         <button aria-label={running ? '停止执行' : '发送'} className={`send-button composer-primary-button${running ? ' stop-button' : ''}`}
           type={running ? 'button' : 'submit'} disabled={busy || !enabled || (!running && !prompt.trim())} onClick={running ? onCancel : undefined}>
           {running ? <Square size={17} /> : <ArrowUp size={18} />}
@@ -67,7 +68,10 @@ function conversationFromFacts(records: FactRecord[]) {
     if (fact.type === 'request_prepared') requests.set(fact.request.id, fact.request.purpose)
     let message: Message | undefined
     if (fact.type === 'input_queued' || fact.type === 'context_appended') message = fact.message
-    if (fact.type === 'model_settled' && requests.get(fact.request) === 'main') message = fact.message ?? undefined
+    if (fact.type === 'model_settled' && requests.get(fact.request) === 'main') message = fact.result?.message ?? (fact as unknown as { message?: Message }).message
+    if (fact.type === 'session_imported') {
+      for (const id of fact.surface) { const node = fact.nodes[id]; if (node) entries.push({ id: -(entries.length + 1), message: node.message, tools: [] }) }
+    }
     if (message) {
       const tools = message.tool_calls.map(call => { const tool = { call }; calls.set(call.id, tool); return tool })
       entries.push({ id: seq, message, tools })

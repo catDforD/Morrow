@@ -32,6 +32,29 @@ impl Drop for PendingGuard<'_> {
 }
 
 impl Peer {
+    #[cfg(test)]
+    pub(crate) fn test_connection() -> (Arc<Self>, mpsc::UnboundedReceiver<Message>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            Arc::new(Self {
+                epoch: "epoch".into(),
+                tx,
+                pending: Mutex::new(HashMap::new()),
+                closed: CancellationToken::new(),
+            }),
+            rx,
+        )
+    }
+    #[cfg(test)]
+    pub(crate) fn test_reply(&self, id: &str, value: Value) {
+        self.pending
+            .lock()
+            .unwrap()
+            .remove(id)
+            .unwrap()
+            .send(Ok(value))
+            .unwrap();
+    }
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
@@ -107,7 +130,7 @@ pub async fn serve(socket: WebSocket, runtime: Arc<Runtime>) {
                     let response = match result {
                         Ok(result) => json!({"jsonrpc":"2.0","id":value["id"],"result":result}),
                         Err(error) => {
-                            json!({"jsonrpc":"2.0","id":value["id"],"error":{"code":-32000,"message":error.to_string()}})
+                            json!({"jsonrpc":"2.0","id":value["id"],"error":{"code":-32000,"message":error.to_string(),"data":error.downcast_ref::<crate::protocol::ModelError>()}})
                         }
                     };
                     let _ = peer.send(response);
@@ -118,13 +141,12 @@ pub async fn serve(socket: WebSocket, runtime: Arc<Runtime>) {
         {
             let result = if value["error"].is_null() {
                 Ok(value["result"].clone())
+            } else if let Ok(error) = serde_json::from_value::<crate::protocol::ModelError>(
+                value["error"]["data"].clone(),
+            ) {
+                Err(error.into())
             } else {
-                Err(anyhow!(
-                    "{}",
-                    value["error"]["message"]
-                        .as_str()
-                        .unwrap_or("host RPC failed")
-                ))
+                Err(anyhow!("host RPC failed"))
             };
             let _ = tx.send(result);
         }

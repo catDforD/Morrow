@@ -48,6 +48,7 @@ export function useSession(session: string) {
     let stopped = false
     let socket: WebSocket
     let retry: ReturnType<typeof setTimeout>
+    let activeRun = '', activeRequest = '', sequence = 0
     const connect = () => {
       setConnection('connecting')
       socket = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/events?token=${encodeURIComponent(token())}`)
@@ -56,8 +57,17 @@ export function useSession(session: string) {
         const value = JSON.parse(event.data)
         if (value.type === 'resync' || value.type === 'host_disconnected') { setDelta(''); void refresh(); void refreshDirectory() }
         if (value.session !== session && value.session !== '_workspace') return
-        if (value.type === 'delta' && value.session === session) setDelta(previous => previous + value.text)
+        if (value.type === 'model_progress' && value.purpose === 'main' && value.run === activeRun && value.request === activeRequest && value.sequence > sequence) {
+          sequence = value.sequence
+          if (value.events.some((e: { type: string }) => e.type === 'gap')) setDelta('')
+          setDelta(previous => previous + value.events.filter((e: { type: string }) => e.type === 'text').map((e: { text: string }) => e.text).join(''))
+        }
         if (value.type === 'fact') {
+          const fact = value.record.fact
+          if (fact.type === 'run_started') activeRun = fact.run
+          if (fact.type === 'request_prepared' && fact.request.purpose === 'main') { activeRun = fact.request.run; activeRequest = fact.request.id; sequence = 0; setDelta('') }
+          if (fact.type === 'model_settled' && fact.request === activeRequest) activeRequest = ''
+          if (fact.type === 'run_ended') { activeRun = ''; activeRequest = '' }
           if (value.session === session && ['model_settled', 'run_ended', 'run_started'].includes(value.record.fact.type)) setDelta('')
           void refresh()
           if (['run_ended', 'session_opened'].includes(value.record.fact.type)) void refreshDirectory()
@@ -70,13 +80,12 @@ export function useSession(session: string) {
   }, [session, refresh, refreshDirectory])
 
   useEffect(() => {
-    if (!enabled) return
     const manager = new Clients(session, setViews)
     clients.current = manager
     return () => { clients.current = undefined; void manager.dispose() }
-  }, [session, enabled])
+  }, [session])
   useEffect(() => {
-    if (clients.current && data) void clients.current.sync(data.session, data.workspace).catch(error => setError(String(error)))
+    if (clients.current && data) void clients.current.sync(data.session, data.workspace, enabled).catch(error => setError(String(error)))
   }, [data, enabled])
 
   return { data, timeline, sessions, error, setError, delta, connection, enabled, setEnabled, views, refresh, refreshDirectory, perform }
