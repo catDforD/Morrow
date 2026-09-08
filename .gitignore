@@ -1,4 +1,14 @@
 /target
+/vnext/target/
+/vnext/dist/
+/vnext/node_modules/
+/vnext/packages/*/node_modules/
+/vnext/packages/*/dist/
+/vnext/vendor/*/node_modules/
+/vnext/vendor/*/lib/
+/vnext/test-results/
+/vnext/playwright-report/
+/output/playwright/
 morrow.toml
 .codegraph/
 crates/agent-server/web/node_modules/

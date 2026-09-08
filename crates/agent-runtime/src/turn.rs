@@ -795,15 +795,16 @@ async fn run_agent_turn_inner(
     let build = tokio::select! {
         biased;
         _ = cancellation.cancelled() => None,
-        result = ToolRegistry::with_mcp_cache_and_writer_lease_and_artifact_root_and_tool_filter_async(
-            context.workspace_root,
-            context.permissions,
+        result = ToolRegistry::with_mcp_options(
+            ToolRegistryOptions {
+                writer_lease,
+                artifact_root: artifact_root.clone(),
+                auto_approve_workspace_writes: context.auto_approve_workspace_writes,
+                ..ToolRegistryOptions::new(context.workspace_root, context.permissions)
+            },
             context.mcp_servers,
             context.mcp_cache,
-            writer_lease,
-            artifact_root.clone(),
             tool_filter,
-            context.auto_approve_workspace_writes,
         ) => Some(result),
     };
     let Some(build) = build else {
@@ -885,13 +886,12 @@ async fn run_agent_turn_inner(
                 return Ok(record_cancelled_turn(session, prompt, context.model));
             }
             if !pre_denied {
-                let mut compacted = session.clone();
                 let compaction = tokio::select! {
                     biased;
                     _ = cancellation.cancelled() => None,
-                    result = compact_session_with_context(
+                    result = CompactionDraft::prepare(
                         context.client,
-                        &mut compacted,
+                        session,
                         context.context_config,
                         &pre.context,
                     ) => Some(result),
@@ -899,82 +899,52 @@ async fn run_agent_turn_inner(
                 let Some(compaction) = compaction else {
                     return Ok(record_cancelled_turn(session, prompt, context.model));
                 };
-                let compaction = match compaction {
-                    Ok(compaction) => compaction,
+                let draft = match compaction {
+                    Ok(draft) => draft,
                     Err(error) => {
-                        let message = format!("context compaction failed: {error}");
-                        apply_turn_with_model(
+                        return Ok(record_failed_turn(
                             session,
-                            TurnRecord::failed_user_prompt(prompt, message.clone()),
+                            prompt,
                             context.model,
-                        );
-                        return Ok(RunAgentTurnOutcome {
-                            session_changed: true,
-                            error: Some(message),
-                        });
+                            format!("context compaction failed: {error}"),
+                        ));
                     }
                 };
-                if compaction == CompactionOutcome::Changed {
-                    let post = middleware_registry
-                        .runtime()
-                        .run_post_compact(PostCompactInput {
-                            context: middleware_context.clone(),
-                            cause: CompactionCause::Automatic,
-                            previous_summary: previous_summary.clone(),
-                            summary: compacted.context.summary.clone().unwrap_or_default(),
-                            summarized_turns: compacted.context.summarized_turns,
-                        })
-                        .await;
-                    let post_cancelled = post.cancelled;
-                    let fatal_errors = post.fatal_errors.clone();
-                    deliver_turn_middleware_events(
-                        context,
-                        handler,
-                        &mut fact_run,
-                        post.events,
-                        &mut event_index,
+                let mut post = draft
+                    .run_post_compact(
+                        middleware_context.clone(),
+                        middleware_registry,
+                        CompactionCause::Automatic,
                     )
-                    .await?;
-                    if post_cancelled {
-                        return Ok(record_cancelled_turn(session, prompt, context.model));
-                    }
-                    if !fatal_errors.is_empty() {
-                        let message = format!(
-                            "post-compact middleware failed: {}",
-                            fatal_errors.join("; ")
-                        );
-                        apply_turn_with_model(
-                            session,
-                            TurnRecord::failed_user_prompt(prompt, message.clone()),
-                            context.model,
-                        );
-                        return Ok(RunAgentTurnOutcome {
-                            session_changed: true,
-                            error: Some(message),
-                        });
-                    }
-                    initial_context.extend(post.context);
-                    *session = compacted;
+                    .await;
+                deliver_turn_middleware_events(
+                    context,
+                    handler,
+                    &mut fact_run,
+                    std::mem::take(&mut post.events),
+                    &mut event_index,
+                )
+                .await?;
+                if post.cancelled {
+                    return Ok(record_cancelled_turn(session, prompt, context.model));
                 }
-                let compacted_estimate = estimate_context_tokens(
+                if let Err(message) = draft.commit(session, &post) {
+                    return Ok(record_failed_turn(session, prompt, context.model, message));
+                }
+                initial_context.extend(post.context);
+                if let Err(message) = check_compacted_context_budget(
                     &effective_system_prompt,
                     session,
                     prompt,
                     &tool_definitions,
-                );
-                if compacted_estimate > budget {
-                    let message = format!(
-                        "context compaction failed: context is still over token budget after compaction ({compacted_estimate} > {budget})"
-                    );
-                    apply_turn_with_model(
+                    budget,
+                ) {
+                    return Ok(record_failed_turn(
                         session,
-                        TurnRecord::failed_user_prompt(prompt, message.clone()),
+                        prompt,
                         context.model,
-                    );
-                    return Ok(RunAgentTurnOutcome {
-                        session_changed: true,
-                        error: Some(message),
-                    });
+                        format!("context compaction failed: {message}"),
+                    ));
                 }
             }
         }

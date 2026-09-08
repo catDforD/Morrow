@@ -1928,59 +1928,72 @@ async fn tool_filter_trims_built_in_tool_definitions() {
         .expect("registry");
     assert!(names(&all).contains(&SHELL_COMMAND_TOOL_NAME.to_string()));
 
-    let denied =
-        ToolRegistry::with_mcp_cache_and_writer_lease_and_artifact_root_and_tool_filter_async(
+    let denied = ToolRegistry::with_mcp_options(
+        ToolRegistryOptions::new(
             &root,
             PermissionProfile::for_mode(PermissionMode::WorkspaceWrite),
-            &[],
-            &cache,
-            None,
-            None,
-            &ToolsConfig {
-                allow: Vec::new(),
-                deny: vec!["shell_command".to_string()],
-            },
-            true,
-        )
-        .await
-        .expect("registry");
+        ),
+        &[],
+        &cache,
+        &ToolsConfig {
+            allow: Vec::new(),
+            deny: vec!["shell_command".to_string()],
+        },
+    )
+    .await
+    .expect("registry");
     let denied_names = names(&denied);
     assert!(!denied_names.contains(&SHELL_COMMAND_TOOL_NAME.to_string()));
     assert!(denied_names.contains(&READ_FILE_TOOL_NAME.to_string()));
 
-    let allow_only =
-        ToolRegistry::with_mcp_cache_and_writer_lease_and_artifact_root_and_tool_filter_async(
+    let allow_only = ToolRegistry::with_mcp_options(
+        ToolRegistryOptions::new(
             &root,
             PermissionProfile::for_mode(PermissionMode::WorkspaceWrite),
-            &[],
-            &cache,
-            None,
-            None,
-            &ToolsConfig {
-                allow: vec!["read_file".to_string()],
-                deny: Vec::new(),
-            },
-            true,
-        )
-        .await
-        .expect("registry");
+        ),
+        &[],
+        &cache,
+        &ToolsConfig {
+            allow: vec!["read_file".to_string()],
+            deny: Vec::new(),
+        },
+    )
+    .await
+    .expect("registry");
     assert_eq!(names(&allow_only), [READ_FILE_TOOL_NAME.to_string()]);
 
-    let deny_wins =
-        ToolRegistry::with_mcp_cache_and_writer_lease_and_artifact_root_and_tool_filter_async(
+    let deny_wins = ToolRegistry::with_mcp_options(
+        ToolRegistryOptions::new(
             &root,
             PermissionProfile::for_mode(PermissionMode::WorkspaceWrite),
-            &[],
-            &cache,
-            None,
-            None,
-            &ToolsConfig {
-                allow: vec!["read_file".to_string(), "shell_command".to_string()],
-                deny: vec!["shell_command".to_string()],
-            },
-            true,
-        )
-        .await
-        .expect("registry");
+        ),
+        &[],
+        &cache,
+        &ToolsConfig {
+            allow: vec!["read_file".to_string(), "shell_command".to_string()],
+            deny: vec!["shell_command".to_string()],
+        },
+    )
+    .await
+    .expect("registry");
     assert_eq!(names(&deny_wins), [READ_FILE_TOOL_NAME.to_string()]);
+
+    let restricted = ToolRegistry::with_mcp_options(
+        ToolRegistryOptions {
+            allowed: BuiltInToolAllowlist::research(),
+            ..ToolRegistryOptions::new(
+                &root,
+                PermissionProfile::for_mode(PermissionMode::WorkspaceWrite),
+            )
+        },
+        &[],
+        &cache,
+        &ToolsConfig {
+            allow: vec!["read_file".to_string(), "shell_command".to_string()],
+            deny: Vec::new(),
+        },
+    )
+    .await
+    .expect("restricted registry");
+    assert_eq!(names(&restricted), [READ_FILE_TOOL_NAME.to_string()]);
 }

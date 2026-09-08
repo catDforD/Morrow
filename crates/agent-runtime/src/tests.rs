@@ -1,7 +1,7 @@
 use super::*;
 use agent_core::GateDecision;
 use agent_model::{OpenAiCompatClient, OpenAiCompatConfig};
-use agent_protocol::{FileChangeOperation, ReasoningLevel, SessionContext, Thread, Turn};
+use agent_protocol::{ReasoningLevel, SessionContext, Thread, Turn};
 use futures_util::future::BoxFuture;
 use serde_json::json;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -932,21 +932,22 @@ async fn manual_compaction_summarizes_old_turns_and_rebuilds_active_context() {
 #[tokio::test]
 async fn manual_post_compact_failure_keeps_draft_out_and_returns_audit_events() {
     let root = unique_dir("manual-post-compact-failure");
-    let summary = valid_compact_summary("must be discarded");
-    let (base_url, _) = spawn_recording_sse_server(vec![sse_text_body(&summary)]).await;
+    let client = ConstantModel {
+        text: valid_compact_summary("must be discarded"),
+    };
     let mut session = compactable_session();
     let original = session.clone();
     let mut middleware = MiddlewareRegistry::new();
     middleware.register_runtime(Arc::new(FailingPostCompactMiddleware));
 
     let failure = compact_session_with_middleware_audit(
-        &client(base_url),
+        &client,
         &mut session,
         context_config(2),
         MiddlewareExecutionContext {
             invocation_id: None,
             session: "default".to_string(),
-            workspace_root: root,
+            workspace_root: root.clone(),
             turn_index: original.turns.len(),
             operation_id: None,
             turn_id: None,
@@ -968,6 +969,7 @@ async fn manual_post_compact_failure_keeps_draft_out_and_returns_audit_events() 
         AgentEvent::MiddlewareFinished(invocation)
             if invocation.outcome == agent_protocol::MiddlewareOutcome::FailedClosed
     ));
+    fs::remove_dir_all(root).expect("remove root");
 }
 
 #[test]
@@ -980,6 +982,77 @@ fn compact_summary_parser_accepts_markdown_fenced_contract() {
     let parsed = parse_compact_summary_output(&raw).expect("parse summary");
 
     assert_eq!(parsed, summary_text);
+}
+
+#[tokio::test]
+async fn automatic_post_compact_failure_preserves_context_and_delivers_audit() {
+    let root = unique_dir("automatic-post-compact-failure");
+    let client = ConstantModel {
+        text: valid_compact_summary("must be discarded"),
+    };
+    let mut session = compactable_session();
+    let original = session.clone();
+    let mut middleware = MiddlewareRegistry::new();
+    middleware.register_runtime(Arc::new(FailingPostCompactMiddleware));
+    let cache = McpToolCache::new();
+    let mut handler = RecordingHandler::default();
+    let context = RunAgentTurnContext {
+        client: &client,
+        model: test_model_invocation(),
+        subagent_identities: &[],
+        system_prompt: "system",
+        context_config: ContextConfig {
+            max_context_tokens: Some(1),
+            ..context_config(2)
+        },
+        model_limits: model_limits(10_000),
+        workspace_root: &root,
+        workspace_instructions: None,
+        permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
+        mcp_servers: &[],
+        mcp_cache: &cache,
+        tools: None,
+        auto_approve_workspace_writes: true,
+        session_name: "default",
+        turn_index: session.turns.len(),
+    };
+
+    let outcome = run_agent_turn_with_middleware_context(
+        MiddlewareAgentTurnContext::new(context, &middleware, MiddlewareAgentScope::Main),
+        &mut session,
+        "continue",
+        &mut handler,
+        CancellationToken::new(),
+    )
+    .await
+    .expect("record failed turn");
+
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("rejected compact draft")
+    );
+    assert_eq!(session.context, original.context);
+    assert_eq!(session.active_thread, original.active_thread);
+    assert_eq!(&session.turns[..original.turns.len()], &original.turns);
+    assert_eq!(
+        session.turns.last().unwrap().turn.status,
+        TurnStatus::Failed
+    );
+    assert!(matches!(
+        &handler.events.last().expect("post-compact audit").event,
+        AgentEvent::MiddlewareFinished(invocation)
+            if invocation.outcome == agent_protocol::MiddlewareOutcome::FailedClosed
+    ));
+    assert!(
+        !handler
+            .events
+            .iter()
+            .any(|event| matches!(event.event, AgentEvent::TurnStarted))
+    );
+    fs::remove_dir_all(root).expect("remove root");
 }
 
 #[tokio::test]
@@ -2290,18 +2363,4 @@ async fn auto_compaction_llm_failure_falls_back_and_runs_main_turn() {
     );
     assert_eq!(requests.lock().expect("requests lock poisoned").len(), 2);
     assert!(!handler.events.is_empty());
-}
-
-#[test]
-fn file_summary_helper_is_available_to_tests() {
-    let file = agent_protocol::FileChangeSummary {
-        path: "note.txt".to_string(),
-        operation: FileChangeOperation::Add,
-        replacements: 0,
-        created: true,
-        overwritten: false,
-        deleted: false,
-    };
-
-    assert_eq!(file.operation.as_str(), "add");
 }

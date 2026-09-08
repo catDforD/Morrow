@@ -1,4 +1,5 @@
 use super::*;
+use agent_core::ObservationRun;
 
 const REQUIRED_SUMMARY_SECTIONS: [&str; 7] = [
     "User Goals and Constraints",
@@ -13,6 +14,87 @@ const REQUIRED_SUMMARY_SECTIONS: [&str; 7] = [
 pub enum CompactionOutcome {
     Changed,
     Noop,
+}
+
+/// A summary is committed only after post-compact middleware accepts it.
+pub(crate) struct CompactionDraft {
+    session: Session,
+    previous_summary: Option<String>,
+    outcome: CompactionOutcome,
+}
+
+impl CompactionDraft {
+    pub(crate) async fn prepare(
+        client: &dyn Model,
+        session: &Session,
+        config: ContextConfig,
+        context: &[MiddlewareContextBlock],
+    ) -> Result<Self, RuntimeError> {
+        let mut draft = session.clone();
+        let outcome = compact_session_with_context(client, &mut draft, config, context).await?;
+        Ok(Self {
+            session: draft,
+            previous_summary: session.context.summary.clone(),
+            outcome,
+        })
+    }
+
+    pub(crate) async fn run_post_compact(
+        &self,
+        context: MiddlewareExecutionContext,
+        middleware: &MiddlewareRegistry,
+        cause: CompactionCause,
+    ) -> ObservationRun {
+        if self.outcome == CompactionOutcome::Noop {
+            return ObservationRun::default();
+        }
+        middleware
+            .runtime()
+            .run_post_compact(PostCompactInput {
+                context,
+                cause,
+                previous_summary: self.previous_summary.clone(),
+                summary: self.session.context.summary.clone().unwrap_or_default(),
+                summarized_turns: self.session.context.summarized_turns,
+            })
+            .await
+    }
+
+    pub(crate) fn commit(
+        self,
+        session: &mut Session,
+        post: &ObservationRun,
+    ) -> Result<CompactionOutcome, String> {
+        if post.cancelled {
+            return Err("operation cancelled".to_string());
+        }
+        if !post.fatal_errors.is_empty() {
+            return Err(format!(
+                "post-compact middleware failed: {}",
+                post.fatal_errors.join("; ")
+            ));
+        }
+        if self.outcome == CompactionOutcome::Changed {
+            *session = self.session;
+        }
+        Ok(self.outcome)
+    }
+}
+
+pub(crate) fn check_compacted_context_budget(
+    system_prompt: &str,
+    session: &Session,
+    prompt: &str,
+    tools: &[ToolDefinition],
+    budget: usize,
+) -> Result<(), String> {
+    let estimate = estimate_context_tokens(system_prompt, session, prompt, tools);
+    if estimate > budget {
+        return Err(format!(
+            "context is still over token budget after compaction ({estimate} > {budget})"
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn truncate_chars(value: String, max_chars: usize) -> (String, bool) {
@@ -63,14 +145,8 @@ pub async fn maybe_auto_compact_with_tools(
 
     compact_session(client, session, context_config).await?;
 
-    let compacted_estimate = estimate_context_tokens(system_prompt, session, prompt, tools);
-    if compacted_estimate > budget {
-        return Err(RuntimeError::AgentRun(format!(
-            "context is still over token budget after compaction ({compacted_estimate} > {budget})"
-        )));
-    }
-
-    Ok(())
+    check_compacted_context_budget(system_prompt, session, prompt, tools, budget)
+        .map_err(RuntimeError::AgentRun)
 }
 
 // Compatibility shim for callers that still pass compaction fields separately.
@@ -156,45 +232,20 @@ pub async fn maybe_auto_compact_with_middleware_context(
             additional_context: Vec::new(),
         });
     }
-    let previous_summary = session.context.summary.clone();
-    let mut draft = session.clone();
-    let outcome =
-        compact_session_with_context(client, &mut draft, context_config, &pre.context).await?;
-    let mut additional_context = Vec::new();
-    if outcome == CompactionOutcome::Changed {
-        let post = registry
-            .runtime()
-            .run_post_compact(PostCompactInput {
-                context: execution_context,
-                cause: CompactionCause::Automatic,
-                previous_summary,
-                summary: draft.context.summary.clone().unwrap_or_default(),
-                summarized_turns: draft.context.summarized_turns,
-            })
-            .await;
-        events.extend(post.events);
-        if post.cancelled {
-            return Err(RuntimeError::AgentRun("operation cancelled".to_string()));
-        }
-        if !post.fatal_errors.is_empty() {
-            return Err(RuntimeError::AgentRun(format!(
-                "post-compact middleware failed: {}",
-                post.fatal_errors.join("; ")
-            )));
-        }
-        additional_context = post.context;
-        *session = draft;
-    }
-    let compacted_estimate = estimate_context_tokens(system_prompt, session, prompt, tools);
-    if compacted_estimate > budget {
-        return Err(RuntimeError::AgentRun(format!(
-            "context is still over token budget after compaction ({compacted_estimate} > {budget})"
-        )));
-    }
+    let draft = CompactionDraft::prepare(client, session, context_config, &pre.context).await?;
+    let mut post = draft
+        .run_post_compact(execution_context, registry, CompactionCause::Automatic)
+        .await;
+    events.append(&mut post.events);
+    let outcome = draft
+        .commit(session, &post)
+        .map_err(RuntimeError::AgentRun)?;
+    check_compacted_context_budget(system_prompt, session, prompt, tools, budget)
+        .map_err(RuntimeError::AgentRun)?;
     Ok(MiddlewareCompactionOutcome {
         outcome,
         events,
-        additional_context,
+        additional_context: post.context,
     })
 }
 
@@ -278,53 +329,24 @@ pub async fn compact_session_with_middleware_audit(
             additional_context: Vec::new(),
         });
     }
-    let previous_summary = session.context.summary.clone();
-    let mut draft = session.clone();
-    let outcome = match compact_session_with_context(
-        client,
-        &mut draft,
-        context_config,
-        &pre.context,
-    )
-    .await
+    let draft = match CompactionDraft::prepare(client, session, context_config, &pre.context).await
     {
-        Ok(outcome) => outcome,
+        Ok(draft) => draft,
         Err(error) => return Err(MiddlewareCompactionError { error, events }),
     };
-    if outcome == CompactionOutcome::Noop {
-        return Ok(MiddlewareCompactionOutcome {
-            outcome,
-            events,
-            additional_context: Vec::new(),
-        });
-    }
-    let post = middleware
-        .runtime()
-        .run_post_compact(PostCompactInput {
-            context,
-            cause: CompactionCause::Manual,
-            previous_summary,
-            summary: draft.context.summary.clone().unwrap_or_default(),
-            summarized_turns: draft.context.summarized_turns,
-        })
+    let mut post = draft
+        .run_post_compact(context, middleware, CompactionCause::Manual)
         .await;
-    events.extend(post.events);
-    if post.cancelled {
-        return Err(MiddlewareCompactionError {
-            error: RuntimeError::AgentRun("operation cancelled".to_string()),
-            events,
-        });
-    }
-    if !post.fatal_errors.is_empty() {
-        return Err(MiddlewareCompactionError {
-            error: RuntimeError::AgentRun(format!(
-                "post-compact middleware failed: {}",
-                post.fatal_errors.join("; ")
-            )),
-            events,
-        });
-    }
-    *session = draft;
+    events.append(&mut post.events);
+    let outcome = match draft.commit(session, &post) {
+        Ok(outcome) => outcome,
+        Err(message) => {
+            return Err(MiddlewareCompactionError {
+                error: RuntimeError::AgentRun(message),
+                events,
+            });
+        }
+    };
     Ok(MiddlewareCompactionOutcome {
         outcome,
         events,

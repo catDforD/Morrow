@@ -1,0 +1,32 @@
+name: vNext packages
+on: workflow_dispatch
+jobs:
+  package:
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, artifact: linux-x64 }
+          - { os: ubuntu-24.04-arm, artifact: linux-arm64 }
+          - { os: macos-15-intel, artifact: macos-x64 }
+          - { os: macos-latest, artifact: macos-arm64 }
+          - { os: windows-latest, artifact: windows-x64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.3
+      - run: pnpm install --frozen-lockfile
+        working-directory: vnext
+      - run: cargo test --workspace && cargo build --bin morrow-kernel && cargo build --release --bin morrow-kernel
+        working-directory: vnext
+      - run: pnpm build && pnpm typecheck && pnpm test && node scripts/package.mjs && node tests/package-smoke.mjs
+        working-directory: vnext
+      - uses: actions/upload-artifact@v4
+        with:
+          name: morrow-next-${{ matrix.artifact }}
+          path: vnext/dist/morrow-next

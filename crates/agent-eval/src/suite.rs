@@ -33,6 +33,7 @@ pub fn builtin_suite() -> Vec<Scenario> {
         empty_tool_call_list_rejected(),
         reasoning_content_preserved(),
         after_turn_continue_reruns_model(),
+        model_messages_survive_tools_and_continuation(),
         after_turn_fail_fails_turn(),
     ]
 }
@@ -483,6 +484,56 @@ fn after_turn_continue_reruns_model() -> Scenario {
             .request_contains(1, "done, tests should pass"),
     )
     .with_budget(Budget::new(2, 0, 1_200))
+}
+
+fn model_messages_survive_tools_and_continuation() -> Scenario {
+    Scenario::new(
+        "model_messages_survive_tools_and_continuation",
+        "Assistant text and reasoning survive tool calls and after-turn continuation without leaking into the final message.",
+        "inspect the file and verify the answer",
+    )
+    .with_tool(read_tool("read_file", "file contents"))
+    .with_script(ModelScript::new(vec![
+        ModelStep::reasoning("need to inspect the file"),
+        ModelStep::text("reading the file"),
+        ModelStep::tool_calls(vec![tool_call("read-1", "read_file", "{}")]),
+    ]))
+    .with_script(ModelScript::new(vec![
+        ModelStep::reasoning("initial interpretation"),
+        ModelStep::text("draft answer"),
+        ModelStep::completed(),
+    ]))
+    .with_script(ModelScript::new(vec![
+        ModelStep::reasoning("verified interpretation"),
+        ModelStep::text("verified answer"),
+        ModelStep::completed(),
+    ]))
+    .with_after_turn_script(vec![
+        AfterTurnAction::continue_with("verify the interpretation"),
+        AfterTurnAction::Complete,
+    ])
+    .with_expectations(
+        Expectations::completed()
+            .equals("verified answer")
+            .reasoning_equals("verified interpretation")
+            .model_calls(3)
+            .tool_sequence(vec!["read_file"])
+            .tool_calls_started(1)
+            .message_roles(vec![
+                Role::User,
+                Role::Assistant,
+                Role::Tool,
+                Role::Assistant,
+                Role::Assistant,
+            ])
+            .request_contains(1, "reading the file")
+            .request_contains(1, "need to inspect the file")
+            .request_contains(1, "file contents")
+            .request_contains(2, "draft answer")
+            .request_contains(2, "initial interpretation")
+            .request_contains(2, "verify the interpretation"),
+    )
+    .with_budget(Budget::new(3, 1, 1_500))
 }
 
 fn after_turn_fail_fails_turn() -> Scenario {
