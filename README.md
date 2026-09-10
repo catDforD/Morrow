@@ -2,7 +2,7 @@
 
 # Morrow
 
-**A local-first coding agent — CLI, interactive REPL, and browser Web Dashboard, backed by any OpenAI-compatible API.**
+**A local-first coding agent with CLI, Web, and multi-agent collaboration.**
 
 [![Release](https://img.shields.io/github/v/release/catDforD/morrow?style=flat-square)](https://github.com/catDforD/morrow/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
@@ -14,23 +14,19 @@
 
 </div>
 
-Morrow reads and edits files, applies patches, runs shell commands behind explicit permissions, streams model output, and persists project-scoped sessions — all against your own OpenAI-compatible Chat Completions endpoint.
+Morrow connects your OpenAI-compatible Chat Completions endpoint to a Rust agent runtime. Read and edit code, run commands with permission controls, and resume project sessions from the CLI or browser dashboard. Web sessions also support background subagents for exploration, planning, implementation, and review.
+
+[Quick start](#quick-start) · [Multi-agent collaboration](#multi-agent-collaboration) · [Configuration](#configuration) · [Development](#development)
 
 ## Features
 
-- **Two entry points, one runtime** — CLI one-shots and interactive REPL, plus a local browser Web Dashboard.
-- **Bring your own model** — any OpenAI-compatible endpoint, configured per provider and per session.
-- **Real tools** — file reads/edits, patches, search, directory listing, and shell commands.
-- **Permission profiles** — read-only, workspace-write, and full-access modes, with shell controlled separately.
-- **Policy hooks** — trusted command hooks at `before_prompt`, `before_tool`, `permission_request`, `after_tool`, `after_turn`, and compaction boundaries; project hooks require an explicit `morrow hooks trust`.
-- **MCP support** — stdio and Streamable HTTP MCP servers.
-- **Session-scoped subagents** — persistent `explore`, `plan`, `worker`, and `reviewer` instances running in the background.
-- **Long-session friendly** — named, resumable sessions with automatic context compaction.
-- **Scriptable** — JSONL event output for automation.
+- **CLI and Web** — one-shot prompts, an interactive REPL, and a browser dashboard share one runtime; JSONL output supports automation.
+- **Model and tool integration** — OpenAI-compatible models, built-in file/search/shell tools, and MCP over stdio or Streamable HTTP.
+- **Multi-agent collaboration** — background exploration, planning, implementation, and review with configurable roles, names, and avatars.
+- **Persistent context** — project-scoped sessions, resumable subagents, and automatic context compaction.
+- **Controlled execution** — permission profiles, approval queues, project instructions, and lifecycle hooks for verification.
 
 ## Installation
-
-### CLI
 
 macOS and Linux:
 
@@ -55,7 +51,61 @@ morrow                               # interactive REPL
 morrow server                        # web dashboard on 127.0.0.1:3000
 ```
 
-The dashboard is local-first — keep it bound to localhost. On startup it prints a one-time bootstrap URL that signs the browser in with an `HttpOnly` cookie; other local processes get `401`. Pass `--no-auth` to disable this for debugging, and `--permission-ceiling` (or `[server] permission_ceiling` in `morrow.toml`) to cap the permission mode the browser may pick per turn. `[permissions]` applies to the CLI only.
+Run these commands from your project directory. For Web, open the login URL printed in the terminal; it sets an `HttpOnly` session cookie. The server defaults to `127.0.0.1:3000` and can start without model configuration so you can add a provider in **Settings → Models**.
+
+Web permissions are selected per turn, defaulting to `workspace_write`. Use `--permission-ceiling` (or `[server] permission_ceiling`) to cap that choice. `[permissions]` configures the CLI. Keep the server on localhost; `--no-auth` is available for local debugging.
+
+## Multi-agent collaboration
+
+In Web sessions, the main agent can delegate work to persistent subagents and collect their results. Each instance keeps its own conversation and execution history, and can continue running after the parent turn ends.
+
+### Roles and identities
+
+Open **Settings → Subagents** to configure your team:
+
+| Setting | What you can customize |
+| --- | --- |
+| Role capabilities | Model and reasoning level, additional instructions, timeout, and maximum tool rounds for each role |
+| Identity and appearance | A searchable global roster with editable names and PNG/JPEG/WebP avatars; add or remove entries and restore the default roster |
+
+Roles determine tools and permission ceilings; the roster supplies display names and avatars. Creating a roster entry makes an identity available for future tasks. The main agent starts an actual task by spawning a subagent in a conversation.
+
+<p align="center">
+  <img src="web_design/subagents.png" alt="Subagent settings with a searchable roster of custom names and avatars" width="900">
+</p>
+
+*Example of a customized roster. Names and avatars are editable in Settings.*
+
+| Role | Typical work | Tool access |
+| --- | --- | --- |
+| `explore` | Investigate code and locate relevant files | Read, list, search; shell denied |
+| `plan` | Analyze requirements and propose an implementation | Read, list, search; shell denied |
+| `worker` | Implement changes | File reads/writes, patches, shell with approval |
+| `reviewer` | Review changes and run checks | Read, list, search, shell with approval; no file-write tools |
+
+For example, ask the main agent:
+
+> Have explore locate the code for this issue, then ask plan for an implementation plan. Let worker make the changes, and have reviewer check the diff and run the relevant tests. Summarize the changes and test results.
+
+### Follow tasks in the dashboard
+
+Open the session's **Subagents** inspector to view status, messages, tool activity, and results. Send follow-up work to an idle or interrupted instance using its existing context, cancel an active task, or delete an inactive instance. Parent and subagent approval requests appear in the same queue with their source identified.
+
+Each session supports **up to 8 persistent instances and 4 concurrent runs**. Reads can proceed in parallel; parent file writes and shell commands, worker runs, and approved reviewer commands share a workspace write lock. Access remains bounded by the parent's permissions, the role ceiling, and tool filters. Subagents have no MCP or further-delegation tools.
+
+The CLI provides temporary, synchronous read-only delegation through `delegate_task`. Persistent task management and the inspector are available in Web sessions.
+
+<details>
+<summary>Runtime settings and persistence</summary>
+
+- Persistent tasks use `spawn_subagent`, `send_subagent`, `inspect_subagent`, `wait_subagents`, and `cancel_subagent`.
+- Each role accepts up to 4,000 characters of additional instructions, a 30–1,800 second timeout, and 1–99 tool rounds. Role settings and identity names are captured when an instance is created.
+- Settings live in `~/.morrow/subagents.json`; task histories live in `~/.morrow/subagent-sessions/<workspace-scope>/<session>/`.
+- In-workspace writes by subagents are auto-approved regardless of `workspace_write_require_approval`. Shell commands require approval when allowed by the parent profile. Approved file changes are revalidated before writing.
+- On restart, unfinished runs become `interrupted`; pending approvals and locks are cleared. Continue an instance explicitly to resume work.
+- At 16 MiB, the event log stops retaining streaming deltas but continues recording messages, tools, approvals, and terminal events. Model credentials stay in memory during a run.
+
+</details>
 
 ## Configuration
 
@@ -66,13 +116,17 @@ The dashboard is local-first — keep it bound to localhost. On startup it print
 base_url = "https://api.openai.com/v1"
 model = "gpt-4.1"
 api_key_env = "OPENAI_API_KEY"
+context_window_tokens = 128000
+reserved_output_tokens = 8192
 
 [permissions]
 mode = "read_only"
 shell = "deny"
 ```
 
-An inline `OPENAI_API_KEY` wins when present; otherwise Morrow reads the `api_key_env` variable. Never commit a config containing a real key. Web-only settings (models, MCP servers, commands, subagents) are managed in the dashboard and stored under `~/.morrow/`. See [`morrow.example.toml`](morrow.example.toml) for the full set of options, including context compaction tuning.
+Set `context_window_tokens` to your model's supported context size; it is required for CLI configuration. An inline `OPENAI_API_KEY` wins when present; otherwise Morrow reads the `api_key_env` variable. Never commit a config containing a real key.
+
+Web settings for models, MCP servers, commands, and subagents are managed in the dashboard and stored under `~/.morrow/`. See [`morrow.example.toml`](morrow.example.toml) for all options, including context compaction tuning.
 
 ### Project instructions
 
@@ -95,7 +149,7 @@ Use `[tools] allow` / `deny` in `morrow.toml` to restrict which tools the main a
 
 ### Policy hooks
 
-Command hooks run at the lifecycle boundaries above. User-level hooks live in `~/.morrow/hooks.toml`; project hooks live in `<workspace>/.morrow/hooks.toml` and are **disabled until you run `morrow hooks trust`** for that exact hook configuration (fingerprint-pinned, `morrow hooks revoke` to remove). Hooks execute with your user permissions, so review them like shell commands. Manage them with `morrow hooks list | trust | revoke`.
+Hooks run at `before_prompt`, `before_tool`, `permission_request`, `after_tool`, `after_turn`, and compaction boundaries. User-level hooks live in `~/.morrow/hooks.toml`; project hooks live in `<workspace>/.morrow/hooks.toml` and are **disabled until you run `morrow hooks trust`** for that exact configuration. Trust is pinned to its SHA-256 fingerprint and can be removed with `morrow hooks revoke`. Hooks execute with your user permissions; review their commands before trusting them.
 
 An `after_turn` hook runs when the model declares the turn complete, before the turn is accepted. It receives the final text and a turn summary, and answers `{"decision": "complete" | "continue" | "fail"}`: `continue` feeds `additional_context` back into the conversation for one more model call (at most 3 times per turn, then the turn completes with a warning), `fail` fails the turn with the given reason. For example, a verification gate that reruns the test suite:
 
@@ -105,19 +159,6 @@ id = "verify-tests"
 event = "after_turn"
 command = ["/bin/sh", "-c", "cargo test --workspace >/dev/null 2>&1 && printf '%s' '{\"decision\":\"complete\"}' || printf '%s' '{\"decision\":\"continue\",\"additional_context\":[\"cargo test is still red; fix the failures before finishing\"]}'"]
 ```
-
-### Subagents
-
-Web sessions can spawn persistent background subagents (`spawn_subagent`, `send_subagent`, `wait_subagents`, …) and inspect, continue, cancel, or delete them from the Subagents inspector. A parent turn can end while its subagents keep running.
-
-| Role | Built-in tools | Permission ceiling |
-| --- | --- | --- |
-| `explore` | Read, list, search | Read-only; shell denied |
-| `plan` | Read, list, search | Read-only; shell denied |
-| `worker` | File reads/writes, patches, shell | Workspace-write; shell always prompts |
-| `reviewer` | Read, list, search, shell | No file writes; every shell command prompts |
-
-Effective access is the intersection of the parent's permission profile, the role ceiling, the role's tool allowlist, and the `[tools] allow/deny` filter; subagents never receive MCP or delegation tools. Subagent runs are unattended, so in-workspace writes are auto-approved for them regardless of `workspace_write_require_approval`. Each session keeps at most 8 instances and runs at most 4 concurrently. The synchronous, read-only `delegate_task` tool remains available everywhere (including the CLI) for quick one-off delegation. Per-role model, prompt, timeout, and identity settings live under **Settings → Subagents**.
 
 ### Web custom commands
 
@@ -146,7 +187,7 @@ morrow --allow-shell "run the test suite and explain failures"
 
 Shell policy is an approval boundary, not an OS sandbox — an approved command runs with your user permissions. Use an external sandbox when stronger isolation is required.
 
-In `workspace_write` mode, writes that resolve inside the workspace are auto-approved — only shell commands, out-of-workspace writes (rejected outright), and non-read-only MCP tools still gate on approval. To restore the old per-change confirmation:
+In `workspace_write` mode, writes inside the workspace are auto-approved and writes outside it are rejected. Shell commands follow the shell policy; non-read-only MCP tools require approval by default. To require approval for each main-agent file change:
 
 ```toml
 [permissions]
@@ -181,9 +222,14 @@ JSONL mode requires a prompt and is unavailable in interactive mode or with sess
 
 Crate boundaries, turn lifecycle, and extension points: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
+This README covers the Rust workspace in `crates/`. The experimental next-generation runtime has its own [vnext guide](vnext/README.md).
+
 <p align="center">
   <img src="docs/architecture/architecture-ports.svg" alt="Morrow architecture — core defines ports, adapters implement them" width="720">
 </p>
+
+<details>
+<summary>Workspace crates</summary>
 
 | Crate | Responsibility |
 | --- | --- |
@@ -199,6 +245,8 @@ Crate boundaries, turn lifecycle, and extension points: [`ARCHITECTURE.md`](ARCH
 | `agent-sandbox` | Permission evaluation |
 | `agent-tools` | Built-in file and shell tools |
 
+</details>
+
 ```bash
 cargo build --workspace
 cargo test --workspace
@@ -210,22 +258,31 @@ cargo run -p agent-cli -- "hello"
 cargo run -p agent-cli -- server
 ```
 
-Web dashboard (with the server running in a separate terminal):
+Web dashboard development uses Vite's API/WebSocket proxy. Start the local backend in one terminal:
 
 ```bash
-cd crates/agent-server/web && pnpm install && pnpm dev
+cargo run -p agent-cli -- server --no-auth
+```
+
+Then start the frontend in another:
+
+```bash
+cd crates/agent-server/web
+pnpm install --frozen-lockfile
+pnpm dev
 ```
 
 Tagging the workspace version (e.g. `v0.4.0`) triggers GitHub Actions to publish CLI archives and checksums.
 
 ## Uninstall
 
-Remove the CLI binary; local state under `~/.morrow` is retained intentionally:
+Remove the CLI and its bundled search binary from the installation directory:
 
 ```bash
-rm -f ~/.local/bin/morrow
-rm -rf ~/.morrow   # sessions, config, and keys — only if you want them gone
+rm -f ~/.local/bin/morrow ~/.local/bin/morrow-rg
 ```
+
+Local sessions, configuration, and keys remain under `~/.morrow/`. Delete that directory only if you also want to remove those data.
 
 ## License
 

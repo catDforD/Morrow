@@ -2,7 +2,7 @@
 
 # Morrow
 
-**本地优先的编码 Agent —— CLI、交互式 REPL 与浏览器 Web 仪表盘，兼容任意 OpenAI 风格 API。**
+**本地优先的编码 Agent，支持 CLI、Web 与多智能体协作。**
 
 [![Release](https://img.shields.io/github/v/release/catDforD/morrow?style=flat-square)](https://github.com/catDforD/morrow/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
@@ -14,24 +14,19 @@
 
 </div>
 
-Morrow 以流式方式输出模型结果，按项目持久化会话，可以读写文件、应用补丁、在明确授权下执行 shell 命令，并能输出 JSONL 事件用于自动化。所有能力都运行在你自己的 OpenAI 兼容 Chat Completions 端点上。
+Morrow 将你配置的 OpenAI 兼容 Chat Completions 端点接入 Rust Agent 运行时。通过 CLI 或浏览器仪表盘读写代码、按权限执行命令和续接项目会话；Web 会话还支持按角色分配后台子任务，完成探索、规划、实现与审查。
+
+[快速上手](#快速上手) · [多智能体协作](#多智能体协作) · [配置](#配置) · [开发](#开发)
 
 ## 功能特性
 
-- **两个入口，一个运行时** —— CLI 单次执行、交互式 REPL，以及本地浏览器 Web 仪表盘。
-- **自带模型** —— 通过 `--config`、本地 `morrow.toml` 或 `~/.morrow/config.toml` 配置 OpenAI 兼容模型；Web 端可独立管理服务商，并按会话选择模型与推理档位。
-- **持久化会话** —— 按项目划分的命名会话，支持列表、重命名、导出和续接。
-- **真实工具** —— 文件读写、补丁、搜索、目录列举与 shell 命令。
-- **权限档案** —— 只读、工作区写入、完全访问；shell 单独控制。
-- **策略 Hook** —— 在 `before_prompt`、`before_tool`、`permission_request`、`after_tool`、`after_turn` 与压缩前后运行受信命令 Hook；项目 Hook 需要显式 `morrow hooks trust` 后才生效。
-- **MCP 支持** —— 通过 TOML 或仪表盘配置 stdio 与 Streamable HTTP MCP 服务器。
-- **会话级 Subagent** —— 在后台运行持久化的 `explore`、`plan`、`worker`、`reviewer` 实例，并可在 Web 中查看、继续、取消或删除。
-- **长会话友好** —— 自动上下文压缩。
-- **可脚本化** —— JSONL 事件输出，便于自动化与集成。
+- **CLI 与 Web** —— 单次提示、交互式 REPL 和浏览器仪表盘共用运行时，支持 JSONL 自动化输出。
+- **模型与工具接入** —— OpenAI 兼容模型、内置文件/搜索/shell 工具，以及 stdio 和 Streamable HTTP MCP。
+- **多智能体协作** —— 在后台分工探索、规划、实现与审查，自定义角色配置、姓名和头像。
+- **持久上下文** —— 按项目保存会话、续接子任务，并自动压缩长对话。
+- **执行控制** —— 权限档案、审批队列、项目指令和用于验收的生命周期 Hook。
 
 ## 安装
-
-### CLI
 
 macOS 和 Linux：
 
@@ -40,14 +35,7 @@ curl -fsSL https://raw.githubusercontent.com/catDforD/morrow/main/install.sh | s
 morrow init
 ```
 
-安装指定版本或自定义目录：
-
-```bash
-MORROW_VERSION=v0.3.1 curl -fsSL https://raw.githubusercontent.com/catDforD/morrow/main/install.sh | sh
-MORROW_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/catDforD/morrow/main/install.sh | sh
-```
-
-Windows 可从 GitHub Releases 下载 `morrow-x86_64-pc-windows-msvc.zip`，将 `morrow.exe` 与 `morrow-rg.exe` 解压到同一目录并加入 `PATH`。
+可通过安装脚本的 `MORROW_VERSION` / `MORROW_INSTALL_DIR` 环境变量指定版本或目录。Windows 可从 GitHub Releases 下载 `morrow-x86_64-pc-windows-msvc.zip`，将 `morrow.exe` 与 `morrow-rg.exe` 解压到同一目录并加入 `PATH`。
 
 从源码安装：
 
@@ -60,58 +48,91 @@ cargo install --git https://github.com/catDforD/morrow --locked -p agent-cli
 ```bash
 morrow "summarize this repository"   # 单次提示
 morrow                               # 交互模式
-morrow server                        # 本地 Web 仪表盘
+morrow server                        # Web 仪表盘，默认 127.0.0.1:3000
 ```
 
-仪表盘默认监听 `127.0.0.1:3000`，使用当前工作区、配置、会话与权限。它是本地优先且无鉴权的，不要绑定到公网。可用 `morrow server --host 127.0.0.1 --port 3000` 自定义地址。
+在项目目录中运行上述命令。使用 Web 时，打开终端打印的登录链接，浏览器会获得 `HttpOnly` 会话 Cookie。服务默认监听 `127.0.0.1:3000`；尚未配置模型时也能启动，可在 **设置 → 模型设置** 中添加服务商。
 
-仪表盘按 turn 独立选择权限（默认 `workspace_write`，并记住浏览器端最近一次选择）；`morrow.toml` 中的 `[permissions]` 仅作用于 CLI。
+Web 按 turn 选择权限，默认 `workspace_write`；可用 `--permission-ceiling` 或 `[server] permission_ceiling` 限制可选范围。`[permissions]` 配置 CLI 权限。服务请保持监听本机；`--no-auth` 可用于本地调试。
+
+## 多智能体协作
+
+在 Web 会话中，主智能体可以把任务分配给持久化子智能体，再收集各自的结果。每个实例保留独立的对话上下文和执行记录，主智能体本轮结束后，子任务仍可继续运行。
+
+### 角色与身份
+
+打开 **设置 → 子智能体**，配置你的协作团队：
+
+| 设置 | 可配置内容 |
+| --- | --- |
+| 角色能力 | 为各角色选择模型与推理级别、追加指令，并设置超时和最大工具轮次 |
+| 身份外观 | 搜索全局名单、修改姓名、上传 PNG/JPEG/WebP 头像，支持新增、删除和恢复默认身份 |
+
+角色决定工具与权限上限，身份名单提供展示用的姓名和头像。新建名单条目后，该身份可供后续任务使用；实际任务由主智能体在对话中创建子智能体来执行。
+
+<p align="center">
+  <img src="web_design/subagents.png" alt="子智能体设置：可搜索的全局名单、自定义姓名与头像" width="900">
+</p>
+
+*自定义名单示例。姓名与头像均可在设置中修改。*
+
+| 角色 | 适合的任务 | 工具权限 |
+| --- | --- | --- |
+| `explore` | 探索代码、定位相关文件 | 读取、列目录、搜索；禁止 shell |
+| `plan` | 分析需求、制定实现方案 | 读取、列目录、搜索；禁止 shell |
+| `worker` | 执行代码修改 | 文件读写、补丁；shell 需审批 |
+| `reviewer` | 审查改动、运行检查 | 读取、列目录、搜索；shell 需审批，不提供文件写工具 |
+
+例如，可以向主智能体提出：
+
+> 请让 explore 定位这个问题涉及的代码，再让 plan 给出实现方案；由 worker 完成修改，最后交给 reviewer 检查 diff 并运行相关测试。汇总改动和测试结果。
+
+### 在仪表盘中跟进任务
+
+打开会话中的 **子智能体** 检查器，查看状态、消息、工具执行过程和结果。可以使用已有上下文向空闲或中断实例追加任务、取消活跃任务，或删除非活跃实例。父子智能体的审批请求进入同一队列，并标明来源。
+
+每个会话最多保留 **8 个持久实例，同时执行 4 个任务**。读取可以并行；主智能体文件写入与 shell、worker 任务和获批的 reviewer 命令共用工作区写锁。实际访问范围受父权限、角色上限与工具过滤共同约束。子智能体不提供 MCP 和继续委派工具。
+
+CLI 通过 `delegate_task` 提供临时、同步、只读的任务委派；持久任务管理与检查器用于 Web 会话。
+
+<details>
+<summary>运行配置与持久化细节</summary>
+
+- 持久任务使用 `spawn_subagent`、`send_subagent`、`inspect_subagent`、`wait_subagents` 和 `cancel_subagent` 管理。
+- 每个角色可追加最多 4,000 字符的指令，设置 30–1,800 秒超时和 1–99 个工具轮次。角色设置和身份姓名在实例创建时保存快照。
+- 设置保存在 `~/.morrow/subagents.json`；任务记录保存在 `~/.morrow/subagent-sessions/<workspace-scope>/<session>/`。
+- 子智能体在工作区内的写入自动放行，不受 `workspace_write_require_approval` 影响；父权限允许的 shell 命令仍需审批。获批文件修改在写入前会重新验证预览。
+- 重启后，未完成任务转为 `interrupted`，待处理审批与锁被清除；需要显式继续实例来恢复工作。
+- 事件日志达到 16 MiB 后停止保留流式增量，继续记录消息、工具、审批和终态事件。任务运行时的模型凭据仅驻留内存。
+
+</details>
 
 ## 配置
 
-```bash
-morrow init
-```
-
-写入 `~/.morrow/config.toml` 并提示输入 API key。生成的 key 以内联方式保存在配置中，请勿提交。可用 `morrow init --template` 生成不含真实 key 的模板，或 `morrow init --force` 覆盖已有配置。
-
-配置查找顺序：`--config` → 当前目录 `morrow.toml` → `~/.morrow/config.toml`。
+`morrow init` 写入 `~/.morrow/config.toml` 并提示输入 API key。配置查找顺序：`--config` → 当前目录 `morrow.toml` → `~/.morrow/config.toml`。
 
 ```toml
 [model]
 base_url = "https://api.openai.com/v1"
 model = "gpt-4.1"
 api_key_env = "OPENAI_API_KEY"
-timeout_secs = 120
 context_window_tokens = 128000
 reserved_output_tokens = 8192
-
-[agent]
-system_prompt = "You are a helpful assistant."
-
-[context]
-auto_compact = true
-auto_compact_threshold = 0.835
-retain_recent_turns = 6
-summary_target_tokens = 12000
-compact_max_retries = 2
 
 [permissions]
 mode = "read_only"
 shell = "deny"
 ```
 
-内联的 `[model].OPENAI_API_KEY` 优先；否则读取 `api_key_env`（默认 `OPENAI_API_KEY`）。CLI 需要有效的模型与 API key；未传 `--config` 时，`morrow server` 即使没有配置也能启动，以便在浏览器中配置第一个服务商。
+`context_window_tokens` 是 CLI 模型配置的必填项，应按模型支持的上下文大小设置。内联的 `OPENAI_API_KEY` 优先；否则读取 `api_key_env` 对应的环境变量。请勿提交含真实密钥的配置。
 
-Web 端的模型、MCP 服务器、自定义命令与 Subagent 设置分别在 **Settings → Models / MCP Servers / Commands / Subagents** 中管理，数据保存在 `~/.morrow/` 下，不影响 CLI 的 TOML 配置。更多示例见 [`morrow.example.toml`](morrow.example.toml)。
+Web 端的模型、MCP 服务器、命令与子智能体设置通过仪表盘管理，保存在 `~/.morrow/`。完整选项和上下文压缩参数见 [`morrow.example.toml`](morrow.example.toml)。
 
 ### 项目指令
 
-工作区启动时，Morrow 会读取已解析工作区根目录下的 `AGENTS.md`，并将其追加到 `[agent].system_prompt`。之后每个 turn 都会检查文件修改时间并重读（mtime 未变时零额外读取），运行中的修改在下一个 turn 生效，主 Agent、临时委派 Agent 和持久 Subagent 均以各自 turn/spawn 时的拼装结果为准。运行时角色限制与权限校验仍然优先，`AGENTS.md` 不能授予额外的工具访问权限。
+Morrow 读取工作区根目录的 `AGENTS.md`，将项目规范加入主智能体与子智能体的系统提示词。每个 turn 检查修改时间并按需重读，修改在下一轮生效。每轮还会追加 `<environment>` 块，包含工作区、操作系统/架构、日期和可用时的 Git 分支。`AGENTS.md` 不能突破当前权限限制，其内容会发给模型服务商，请勿写入密钥。
 
-只加载根目录的 `AGENTS.md`。文件必须是普通 UTF-8 文件且不超过 32 KiB；不会跟随符号链接，也不会查找嵌套文件或备用文件名。文件缺失或为空时直接忽略；读取失败会在启动终端及 **设置 → 关于** 中显示告警，同时继续使用基础 system prompt。
-
-每个 turn 的 system prompt 尾部还会追加 `<environment>` 块（workspace 根目录、操作系统/架构、当前日期，以及可用时的当前 git 分支）。`AGENTS.md` 内容会作为 system prompt 的一部分发送给所配置的模型，因此不要在其中保存密钥等敏感信息。
+只加载根目录的普通 UTF-8 文件，大小上限为 32 KiB；不跟随符号链接或查找嵌套文件。读取问题会在终端和 **设置 → 关于** 中显示。
 
 ### MCP 工具
 
@@ -121,18 +142,16 @@ Web 端的模型、MCP 服务器、自定义命令与 Subagent 设置分别在 *
 [mcp_servers.filesystem]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
-env = {}
-cwd = "."
 enabled = true
-startup_timeout_sec = 10
-tool_timeout_sec = 60
 ```
 
-MCP 工具视为显式配置的受信工具，启用前请检查服务器命令与远程端点。
+服务端未标注 `readOnlyHint` 的 MCP 工具默认每次调用都需审批；可在对应服务器配置中设置 `require_approval = false` 关闭。启用服务器或关闭审批前，请审查其命令和端点。
+
+可用 `[tools] allow` / `deny` 限制主智能体可见的工具，支持内置工具名、整个 MCP 服务器（如 `mcp__filesystem`）和前缀通配符（如 `mcp__filesystem__*`）。`deny` 优先，空 `allow` 表示全部允许；跳过的 MCP 工具会显示在启动诊断中。
 
 ### 策略 Hook
 
-命令 Hook 在上述生命周期边界执行。用户级配置位于 `~/.morrow/hooks.toml`，项目级配置位于 `<workspace>/.morrow/hooks.toml`。项目 Hook 默认禁用：只有对该精确配置执行 `morrow hooks trust`（按 SHA-256 指纹信任）后才生效，`morrow hooks revoke` 可撤销。Hook 以当前用户权限执行，请像审查 shell 命令一样审查后再信任。可用 `morrow hooks list | trust | revoke` 管理。
+Hook 在 `before_prompt`、`before_tool`、`permission_request`、`after_tool`、`after_turn` 及压缩前后执行。用户级配置位于 `~/.morrow/hooks.toml`，项目级配置位于 `<workspace>/.morrow/hooks.toml`。项目 Hook 默认禁用，需执行 **`morrow hooks trust`** 信任该配置的 SHA-256 指纹，可用 `morrow hooks revoke` 撤销。Hook 以当前用户权限执行，请审查命令后再信任。
 
 `after_turn` Hook 在模型自称完成、turn 被接受之前执行。它收到最终文本与 turn 摘要（`final_text`、`tool_call_count`、`turn_message_count`、`tool_names`），返回 `{"decision": "complete" | "continue" | "fail"}`：`continue` 把 `additional_context` 注入对话并再跑一轮模型（每 turn 最多 3 次，超限强制完成并发出警告），`fail` 以给定理由判负该 turn。例如一个 turn 结束前跑测试的验收门：
 
@@ -143,28 +162,9 @@ event = "after_turn"
 command = ["/bin/sh", "-c", "cargo test --workspace >/dev/null 2>&1 && printf '%s' '{\"decision\":\"complete\"}' || printf '%s' '{\"decision\":\"continue\",\"additional_context\":[\"cargo test 仍为红色；先修复再结束\"]}'"]
 ```
 
-### Subagent
-
-Web 会话通过 `spawn_subagent`、`send_subagent`、`inspect_subagent`、`wait_subagents` 和 `cancel_subagent` 管理可后台运行的持久 Subagent。父 turn 结束后子任务仍可继续。用户可以在 Subagents 检查器中查看完整消息与事件日志、使用保留的上下文继续空闲或中断实例、取消活跃任务，或删除终态实例。
-
-| 角色 | 内置工具 | 权限上限 |
-| --- | --- | --- |
-| `explore` | 读取、列目录、搜索 | 只读；禁止 shell |
-| `plan` | 读取、列目录、搜索 | 只读；禁止 shell |
-| `worker` | 文件读写、补丁、shell | 工作区写入；shell 始终审批 |
-| `reviewer` | 读取、列目录、搜索、shell | 不提供文件写工具；每条 shell 都审批 |
-
-有效权限取父权限、角色上限、显式工具 allowlist 与 `[tools] allow/deny` 过滤的交集；权限不足的工具不会出现在模型请求中。Subagent 不会获得 MCP 或继续委派的工具。Subagent run 无人值守执行，因此其工作区内写入始终自动放行，不受 `workspace_write_require_approval` 影响。每个角色可覆盖模型/推理级别、追加最多 4,000 字符的提示词、设置 30–1,800 秒超时和 1–99 个工具轮次。设置变更只影响新实例；实例创建时会快照身份名称、有效提示词、模型与权限上限。
-
-每个会话最多保留 8 个持久实例，同时最多执行 4 个 Subagent run。父智能体的文件写入与 shell、`worker` run、获批的 `reviewer` shell 共用一个 workspace writer lease；读取仍可并行。父子审批请求进入同一个 FIFO 队列并显示来源。文件修改获批后会在真正写入前重新验证预览，工作区已变化时旧审批会被拒绝。
-
-持久实例保存在 `~/.morrow/subagent-sessions/<workspace-scope>/<session>/`。事件日志达到 16 MiB 后停止保存流式 delta，但继续保存消息、工具、审批和终态事件。应用重启时，排队中、运行中和等待审批的 run 会转为 `interrupted`，旧审批与锁被清除，未完成操作绝不会自动重放。模型凭据仅在创建或继续任务时驻留内存，不会写入实例 sidecar。
-
-兼容工具 `delegate_task({task})` 仍保持同步、严格只读：它创建临时 `explore`，随父 turn 取消，且不占持久实例容量。CLI 目前只提供该兼容工具；持久生命周期控制面向 Web。姓名与头像仍在 **Settings → Subagents** 中独立管理（`~/.morrow/subagents.json`）。
-
 ### Web 自定义命令
 
-**Settings → Commands** 管理 `~/.morrow/commands/*.md` 中的斜杠命令（仅 Web 可用）。在输入框键入 `/` 可搜索；`$ARGUMENTS` 会被替换为传入参数。
+**设置 → 命令** 管理 `~/.morrow/commands/*.md` 中的斜杠命令（仅 Web 可用）。在输入框键入 `/` 可搜索；`$ARGUMENTS` 会被替换为传入参数。
 
 ## 权限
 
@@ -182,7 +182,7 @@ Web 会话通过 `spawn_subagent`、`send_subagent`、`inspect_subagent`、`wait
 
 Shell 策略是 Agent 层的审批边界，不是 OS 级只读沙箱。获批命令会继承 Morrow 进程用户的操作系统权限，命令本身仍可能修改文件；批准前应检查命令，需要更强隔离时请配合外部沙箱。
 
-`workspace_write` 模式下，解析到工作区内的写入自动放行——只有 shell 命令、越界写入（直接拒绝）和非只读 MCP 工具仍需审批。如需恢复旧的逐次确认行为：
+`workspace_write` 模式下，工作区内写入自动放行，越界写入直接拒绝。Shell 按其独立策略执行，非只读 MCP 工具默认需审批。若要对主智能体的每次文件修改进行审批：
 
 ```toml
 [permissions]
@@ -202,6 +202,7 @@ morrow --allow-shell "run the test suite and explain failures"
 
 ```bash
 morrow --session work "continue the refactor"
+morrow --session work --reset-session "start over in the same project"
 morrow session list
 morrow session show work
 morrow session export work --output work-session.json
@@ -223,9 +224,14 @@ JSONL 模式要求提供提示词，不可用于交互模式或 session 子命�
 
 crate 边界、turn 生命周期与扩展点见 [`ARCHITECTURE.md`](ARCHITECTURE.md)。
 
+本文介绍 `crates/` 中的 Rust workspace。下一代运行时实验见独立的 [vnext 文档](vnext/README.md)。
+
 <p align="center">
   <img src="docs/architecture/architecture-ports.svg" alt="Morrow 架构 —— 核心定义端口，适配器实现端口" width="720">
 </p>
+
+<details>
+<summary>Workspace crate 职责</summary>
 
 | Crate | 职责 |
 | --- | --- |
@@ -241,6 +247,8 @@ crate 边界、turn 生命周期与扩展点见 [`ARCHITECTURE.md`](ARCHITECTURE
 | `agent-sandbox` | 权限判定 |
 | `agent-tools` | 内置文件与 shell 工具 |
 
+</details>
+
 ```bash
 cargo build --workspace
 cargo test --workspace
@@ -252,23 +260,31 @@ cargo run -p agent-cli -- "hello"
 cargo run -p agent-cli -- server
 ```
 
-Web 前端开发：
+Web 前端通过 Vite 代理 API 与 WebSocket。先在一个终端启动本地后端：
 
 ```bash
-cd crates/agent-server/web && pnpm install && pnpm dev
-# 另开终端：cargo run -p agent-cli -- server
+cargo run -p agent-cli -- server --no-auth
+```
+
+再在另一个终端启动前端：
+
+```bash
+cd crates/agent-server/web
+pnpm install --frozen-lockfile
+pnpm dev
 ```
 
 打与 workspace 版本一致的 tag（如 `v0.4.0`）会触发 GitHub Actions 发布 CLI 压缩包与校验文件。
 
 ## 卸载
 
-删除 CLI 二进制即可。本地数据会有意保留：
+从安装目录移除 CLI 与随附的搜索程序：
 
 ```bash
-rm -f ~/.local/bin/morrow
-rm -rf ~/.morrow
+rm -f ~/.local/bin/morrow ~/.local/bin/morrow-rg
 ```
+
+会话、配置和密钥仍保存在 `~/.morrow/`。如需同时清除这些本地数据，再删除该目录。
 
 ## 许可证
 
