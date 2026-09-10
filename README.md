@@ -2,114 +2,114 @@
 
 # Morrow
 
-**A local-first coding agent with CLI, Web, and multi-agent collaboration.**
+**本地优先的编码 Agent，支持 CLI、Web 与多智能体协作。**
 
 [![Release](https://img.shields.io/github/v/release/catDforD/morrow?style=flat-square)](https://github.com/catDforD/morrow/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange?style=flat-square)](Cargo.toml)
 
-**English** · [简体中文](README.zh-CN.md)
+**简体中文** · [English](README.en.md)
 
-![Morrow web dashboard](web_design/dashboard_v2.png)
+![Morrow Web 仪表盘](web_design/dashboard_v2.png)
 
 </div>
 
-Morrow connects your OpenAI-compatible Chat Completions endpoint to a Rust agent runtime. Read and edit code, run commands with permission controls, and resume project sessions from the CLI or browser dashboard. Web sessions also support background subagents for exploration, planning, implementation, and review.
+Morrow 将你配置的 OpenAI 兼容 Chat Completions 端点接入 Rust Agent 运行时。通过 CLI 或浏览器仪表盘读写代码、按权限执行命令和续接项目会话；Web 会话还支持按角色分配后台子任务，完成探索、规划、实现与审查。
 
-[Quick start](#quick-start) · [Multi-agent collaboration](#multi-agent-collaboration) · [Configuration](#configuration) · [Development](#development)
+[快速上手](#快速上手) · [多智能体协作](#多智能体协作) · [配置](#配置) · [开发](#开发)
 
-## Features
+## 功能特性
 
-- **CLI and Web** — one-shot prompts, an interactive REPL, and a browser dashboard share one runtime; JSONL output supports automation.
-- **Model and tool integration** — OpenAI-compatible models, built-in file/search/shell tools, and MCP over stdio or Streamable HTTP.
-- **Multi-agent collaboration** — background exploration, planning, implementation, and review with configurable roles, names, and avatars.
-- **Persistent context** — project-scoped sessions, resumable subagents, and automatic context compaction.
-- **Controlled execution** — permission profiles, approval queues, project instructions, and lifecycle hooks for verification.
+- **CLI 与 Web** —— 单次提示、交互式 REPL 和浏览器仪表盘共用运行时，支持 JSONL 自动化输出。
+- **模型与工具接入** —— OpenAI 兼容模型、内置文件/搜索/shell 工具，以及 stdio 和 Streamable HTTP MCP。
+- **多智能体协作** —— 在后台分工探索、规划、实现与审查，自定义角色配置、姓名和头像。
+- **持久上下文** —— 按项目保存会话、续接子任务，并自动压缩长对话。
+- **执行控制** —— 权限档案、审批队列、项目指令和用于验收的生命周期 Hook。
 
-## Installation
+## 安装
 
-macOS and Linux:
+macOS 和 Linux：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/catDforD/morrow/main/install.sh | sh
 morrow init
 ```
 
-Pin a version or install directory with `MORROW_VERSION` / `MORROW_INSTALL_DIR`. On Windows, download `morrow-x86_64-pc-windows-msvc.zip` from Releases, extract `morrow.exe` and `morrow-rg.exe` together, and add that directory to `PATH`.
+可通过安装脚本的 `MORROW_VERSION` / `MORROW_INSTALL_DIR` 环境变量指定版本或目录。Windows 可从 GitHub Releases 下载 `morrow-x86_64-pc-windows-msvc.zip`，将 `morrow.exe` 与 `morrow-rg.exe` 解压到同一目录并加入 `PATH`。
 
-From source:
+从源码安装：
 
 ```bash
 cargo install --git https://github.com/catDforD/morrow --locked -p agent-cli
 ```
 
-## Quick start
+## 快速上手
 
 ```bash
-morrow "summarize this repository"   # one-shot
-morrow                               # interactive REPL
-morrow server                        # web dashboard on 127.0.0.1:3000
+morrow "summarize this repository"   # 单次提示
+morrow                               # 交互模式
+morrow server                        # Web 仪表盘，默认 127.0.0.1:3000
 ```
 
-Run these commands from your project directory. For Web, open the login URL printed in the terminal; it sets an `HttpOnly` session cookie. The server defaults to `127.0.0.1:3000` and can start without model configuration so you can add a provider in **Settings → Models**.
+在项目目录中运行上述命令。使用 Web 时，打开终端打印的登录链接，浏览器会获得 `HttpOnly` 会话 Cookie。服务默认监听 `127.0.0.1:3000`；尚未配置模型时也能启动，可在 **设置 → 模型设置** 中添加服务商。
 
-Web permissions are selected per turn, defaulting to `workspace_write`. Use `--permission-ceiling` (or `[server] permission_ceiling`) to cap that choice. `[permissions]` configures the CLI. Keep the server on localhost; `--no-auth` is available for local debugging.
+Web 按 turn 选择权限，默认 `workspace_write`；可用 `--permission-ceiling` 或 `[server] permission_ceiling` 限制可选范围。`[permissions]` 配置 CLI 权限。服务请保持监听本机；`--no-auth` 可用于本地调试。
 
-## Multi-agent collaboration
+## 多智能体协作
 
-In Web sessions, the main agent can delegate work to persistent subagents and collect their results. Each instance keeps its own conversation and execution history, and can continue running after the parent turn ends.
+在 Web 会话中，主智能体可以把任务分配给持久化子智能体，再收集各自的结果。每个实例保留独立的对话上下文和执行记录，主智能体本轮结束后，子任务仍可继续运行。
 
-### Roles and identities
+### 角色与身份
 
-Open **Settings → Subagents** to configure your team:
+打开 **设置 → 子智能体**，配置你的协作团队：
 
-| Setting | What you can customize |
+| 设置 | 可配置内容 |
 | --- | --- |
-| Role capabilities | Model and reasoning level, additional instructions, timeout, and maximum tool rounds for each role |
-| Identity and appearance | A searchable global roster with editable names and PNG/JPEG/WebP avatars; add or remove entries and restore the default roster |
+| 角色能力 | 为各角色选择模型与推理级别、追加指令，并设置超时和最大工具轮次 |
+| 身份外观 | 搜索全局名单、修改姓名、上传 PNG/JPEG/WebP 头像，支持新增、删除和恢复默认身份 |
 
-Roles determine tools and permission ceilings; the roster supplies display names and avatars. Creating a roster entry makes an identity available for future tasks. The main agent starts an actual task by spawning a subagent in a conversation.
+角色决定工具与权限上限，身份名单提供展示用的姓名和头像。新建名单条目后，该身份可供后续任务使用；实际任务由主智能体在对话中创建子智能体来执行。
 
 <p align="center">
-  <img src="web_design/subagents.png" alt="Subagent settings with a searchable roster of custom names and avatars" width="900">
+  <img src="web_design/subagents.png" alt="子智能体设置：可搜索的全局名单、自定义姓名与头像" width="900">
 </p>
 
-*Example of a customized roster. Names and avatars are editable in Settings.*
+*自定义名单示例。姓名与头像均可在设置中修改。*
 
-| Role | Typical work | Tool access |
+| 角色 | 适合的任务 | 工具权限 |
 | --- | --- | --- |
-| `explore` | Investigate code and locate relevant files | Read, list, search; shell denied |
-| `plan` | Analyze requirements and propose an implementation | Read, list, search; shell denied |
-| `worker` | Implement changes | File reads/writes, patches, shell with approval |
-| `reviewer` | Review changes and run checks | Read, list, search, shell with approval; no file-write tools |
+| `explore` | 探索代码、定位相关文件 | 读取、列目录、搜索；禁止 shell |
+| `plan` | 分析需求、制定实现方案 | 读取、列目录、搜索；禁止 shell |
+| `worker` | 执行代码修改 | 文件读写、补丁；shell 需审批 |
+| `reviewer` | 审查改动、运行检查 | 读取、列目录、搜索；shell 需审批，不提供文件写工具 |
 
-For example, ask the main agent:
+例如，可以向主智能体提出：
 
-> Have explore locate the code for this issue, then ask plan for an implementation plan. Let worker make the changes, and have reviewer check the diff and run the relevant tests. Summarize the changes and test results.
+> 请让 explore 定位这个问题涉及的代码，再让 plan 给出实现方案；由 worker 完成修改，最后交给 reviewer 检查 diff 并运行相关测试。汇总改动和测试结果。
 
-### Follow tasks in the dashboard
+### 在仪表盘中跟进任务
 
-Open the session's **Subagents** inspector to view status, messages, tool activity, and results. Send follow-up work to an idle or interrupted instance using its existing context, cancel an active task, or delete an inactive instance. Parent and subagent approval requests appear in the same queue with their source identified.
+打开会话中的 **子智能体** 检查器，查看状态、消息、工具执行过程和结果。可以使用已有上下文向空闲或中断实例追加任务、取消活跃任务，或删除非活跃实例。父子智能体的审批请求进入同一队列，并标明来源。
 
-Each session supports **up to 8 persistent instances and 4 concurrent runs**. Reads can proceed in parallel; parent file writes and shell commands, worker runs, and approved reviewer commands share a workspace write lock. Access remains bounded by the parent's permissions, the role ceiling, and tool filters. Subagents have no MCP or further-delegation tools.
+每个会话最多保留 **8 个持久实例，同时执行 4 个任务**。读取可以并行；主智能体文件写入与 shell、worker 任务和获批的 reviewer 命令共用工作区写锁。实际访问范围受父权限、角色上限与工具过滤共同约束。子智能体不提供 MCP 和继续委派工具。
 
-The CLI provides temporary, synchronous read-only delegation through `delegate_task`. Persistent task management and the inspector are available in Web sessions.
+CLI 通过 `delegate_task` 提供临时、同步、只读的任务委派；持久任务管理与检查器用于 Web 会话。
 
 <details>
-<summary>Runtime settings and persistence</summary>
+<summary>运行配置与持久化细节</summary>
 
-- Persistent tasks use `spawn_subagent`, `send_subagent`, `inspect_subagent`, `wait_subagents`, and `cancel_subagent`.
-- Each role accepts up to 4,000 characters of additional instructions, a 30–1,800 second timeout, and 1–99 tool rounds. Role settings and identity names are captured when an instance is created.
-- Settings live in `~/.morrow/subagents.json`; task histories live in `~/.morrow/subagent-sessions/<workspace-scope>/<session>/`.
-- In-workspace writes by subagents are auto-approved regardless of `workspace_write_require_approval`. Shell commands require approval when allowed by the parent profile. Approved file changes are revalidated before writing.
-- On restart, unfinished runs become `interrupted`; pending approvals and locks are cleared. Continue an instance explicitly to resume work.
-- At 16 MiB, the event log stops retaining streaming deltas but continues recording messages, tools, approvals, and terminal events. Model credentials stay in memory during a run.
+- 持久任务使用 `spawn_subagent`、`send_subagent`、`inspect_subagent`、`wait_subagents` 和 `cancel_subagent` 管理。
+- 每个角色可追加最多 4,000 字符的指令，设置 30–1,800 秒超时和 1–99 个工具轮次。角色设置和身份姓名在实例创建时保存快照。
+- 设置保存在 `~/.morrow/subagents.json`；任务记录保存在 `~/.morrow/subagent-sessions/<workspace-scope>/<session>/`。
+- 子智能体在工作区内的写入自动放行，不受 `workspace_write_require_approval` 影响；父权限允许的 shell 命令仍需审批。获批文件修改在写入前会重新验证预览。
+- 重启后，未完成任务转为 `interrupted`，待处理审批与锁被清除；需要显式继续实例来恢复工作。
+- 事件日志达到 16 MiB 后停止保留流式增量，继续记录消息、工具、审批和终态事件。任务运行时的模型凭据仅驻留内存。
 
 </details>
 
-## Configuration
+## 配置
 
-`morrow init` writes `~/.morrow/config.toml` and prompts for an API key. Lookup order: `--config` → `morrow.toml` in the current directory → `~/.morrow/config.toml`.
+`morrow init` 写入 `~/.morrow/config.toml` 并提示输入 API key。配置查找顺序：`--config` → 当前目录 `morrow.toml` → `~/.morrow/config.toml`。
 
 ```toml
 [model]
@@ -124,17 +124,19 @@ mode = "read_only"
 shell = "deny"
 ```
 
-Set `context_window_tokens` to your model's supported context size; it is required for CLI configuration. An inline `OPENAI_API_KEY` wins when present; otherwise Morrow reads the `api_key_env` variable. Never commit a config containing a real key.
+`context_window_tokens` 是 CLI 模型配置的必填项，应按模型支持的上下文大小设置。内联的 `OPENAI_API_KEY` 优先；否则读取 `api_key_env` 对应的环境变量。请勿提交含真实密钥的配置。
 
-Web settings for models, MCP servers, commands, and subagents are managed in the dashboard and stored under `~/.morrow/`. See [`morrow.example.toml`](morrow.example.toml) for all options, including context compaction tuning.
+Web 端的模型、MCP 服务器、命令与子智能体设置通过仪表盘管理，保存在 `~/.morrow/`。完整选项和上下文压缩参数见 [`morrow.example.toml`](morrow.example.toml)。
 
-### Project instructions
+### 项目指令
 
-Morrow reads `AGENTS.md` from the workspace root and appends it to the system prompt for the main agent and all subagents. The file is re-read on every turn (mtime-cached), so edits take effect on the next turn without restarting. Each turn's system prompt also ends with an `<environment>` block (workspace root, OS/arch, current date, and the current git branch when available). `AGENTS.md` cannot grant tool access beyond the active permission profile, and it is sent to your model provider — don't put secrets in it.
+Morrow 读取工作区根目录的 `AGENTS.md`，将项目规范加入主智能体与子智能体的系统提示词。每个 turn 检查修改时间并按需重读，修改在下一轮生效。每轮还会追加 `<environment>` 块，包含工作区、操作系统/架构、日期和可用时的 Git 分支。`AGENTS.md` 不能突破当前权限限制，其内容会发给模型服务商，请勿写入密钥。
 
-### MCP tools
+只加载根目录的普通 UTF-8 文件，大小上限为 32 KiB；不跟随符号链接或查找嵌套文件。读取问题会在终端和 **设置 → 关于** 中显示。
 
-Register stdio and Streamable HTTP MCP servers in config; their tools are exposed as `mcp__server__tool`:
+### MCP 工具
+
+可在配置中注册 stdio 与 Streamable HTTP MCP 服务器，发现后的工具以 `mcp__server__tool` 形式暴露给模型：
 
 ```toml
 [mcp_servers.filesystem]
@@ -143,60 +145,60 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
 enabled = true
 ```
 
-MCP tools that the server does not mark with `readOnlyHint` require per-call approval by default; set `require_approval = false` on a server to opt out. Review server commands and endpoints before enabling them or disabling approval.
+服务端未标注 `readOnlyHint` 的 MCP 工具默认每次调用都需审批；可在对应服务器配置中设置 `require_approval = false` 关闭。启用服务器或关闭审批前，请审查其命令和端点。
 
-Use `[tools] allow` / `deny` in `morrow.toml` to restrict which tools the main agent sees at all. Entries match built-in tool names exactly, a whole MCP server (`mcp__filesystem`), or a prefix wildcard (`mcp__filesystem__*`); `deny` wins over `allow`, and an empty `allow` list allows everything. Skipped MCP tools are reported as startup diagnostics.
+可用 `[tools] allow` / `deny` 限制主智能体可见的工具，支持内置工具名、整个 MCP 服务器（如 `mcp__filesystem`）和前缀通配符（如 `mcp__filesystem__*`）。`deny` 优先，空 `allow` 表示全部允许；跳过的 MCP 工具会显示在启动诊断中。
 
-### Policy hooks
+### 策略 Hook
 
-Hooks run at `before_prompt`, `before_tool`, `permission_request`, `after_tool`, `after_turn`, and compaction boundaries. User-level hooks live in `~/.morrow/hooks.toml`; project hooks live in `<workspace>/.morrow/hooks.toml` and are **disabled until you run `morrow hooks trust`** for that exact configuration. Trust is pinned to its SHA-256 fingerprint and can be removed with `morrow hooks revoke`. Hooks execute with your user permissions; review their commands before trusting them.
+Hook 在 `before_prompt`、`before_tool`、`permission_request`、`after_tool`、`after_turn` 及压缩前后执行。用户级配置位于 `~/.morrow/hooks.toml`，项目级配置位于 `<workspace>/.morrow/hooks.toml`。项目 Hook 默认禁用，需执行 **`morrow hooks trust`** 信任该配置的 SHA-256 指纹，可用 `morrow hooks revoke` 撤销。Hook 以当前用户权限执行，请审查命令后再信任。
 
-An `after_turn` hook runs when the model declares the turn complete, before the turn is accepted. It receives the final text and a turn summary, and answers `{"decision": "complete" | "continue" | "fail"}`: `continue` feeds `additional_context` back into the conversation for one more model call (at most 3 times per turn, then the turn completes with a warning), `fail` fails the turn with the given reason. For example, a verification gate that reruns the test suite:
+`after_turn` Hook 在模型自称完成、turn 被接受之前执行。它收到最终文本与 turn 摘要（`final_text`、`tool_call_count`、`turn_message_count`、`tool_names`），返回 `{"decision": "complete" | "continue" | "fail"}`：`continue` 把 `additional_context` 注入对话并再跑一轮模型（每 turn 最多 3 次，超限强制完成并发出警告），`fail` 以给定理由判负该 turn。例如一个 turn 结束前跑测试的验收门：
 
 ```toml
 [[hooks]]
 id = "verify-tests"
 event = "after_turn"
-command = ["/bin/sh", "-c", "cargo test --workspace >/dev/null 2>&1 && printf '%s' '{\"decision\":\"complete\"}' || printf '%s' '{\"decision\":\"continue\",\"additional_context\":[\"cargo test is still red; fix the failures before finishing\"]}'"]
+command = ["/bin/sh", "-c", "cargo test --workspace >/dev/null 2>&1 && printf '%s' '{\"decision\":\"complete\"}' || printf '%s' '{\"decision\":\"continue\",\"additional_context\":[\"cargo test 仍为红色；先修复再结束\"]}'"]
 ```
 
-### Web custom commands
+### Web 自定义命令
 
-**Settings → Commands** manages slash commands stored in `~/.morrow/commands/*.md`. Type `/` in the composer to search; `$ARGUMENTS` is replaced with the supplied args.
+**设置 → 命令** 管理 `~/.morrow/commands/*.md` 中的斜杠命令（仅 Web 可用）。在输入框键入 `/` 可搜索；`$ARGUMENTS` 会被替换为传入参数。
 
-## Permissions
+## 权限
 
-| `permissions.mode` | Behavior |
+| `permissions.mode` | 行为 |
 | --- | --- |
-| `read_only` | Write tools denied |
-| `workspace_write` | File changes stay in the workspace and run without approval (see `workspace_write_require_approval` below to restore per-change prompts) |
-| `danger_full_access` | File I/O may leave the workspace |
+| `read_only` | 拒绝写入类工具 |
+| `workspace_write` | 文件修改限制在工作区内并自动放行（可用下文 `workspace_write_require_approval` 恢复逐次审批） |
+| `danger_full_access` | 可访问工作区外路径 |
 
-| `permissions.shell` | Behavior |
+| `permissions.shell` | 行为 |
 | --- | --- |
-| `deny` | Shell denied |
-| `prompt` | Shell needs approval |
-| `allow` | Shell runs without a prompt |
+| `deny` | 拒绝 shell |
+| `prompt` | shell 需批准 |
+| `allow` | shell 直接执行 |
 
-Defaults from `morrow init`: `read_only` + `shell = "deny"`. Override per run with `--permission` / `--allow-shell`:
+Shell 策略是 Agent 层的审批边界，不是 OS 级只读沙箱。获批命令会继承 Morrow 进程用户的操作系统权限，命令本身仍可能修改文件；批准前应检查命令，需要更强隔离时请配合外部沙箱。
 
-```bash
-morrow --permission workspace-write "update the README"
-morrow --allow-shell "run the test suite and explain failures"
-```
-
-Shell policy is an approval boundary, not an OS sandbox — an approved command runs with your user permissions. Use an external sandbox when stronger isolation is required.
-
-In `workspace_write` mode, writes inside the workspace are auto-approved and writes outside it are rejected. Shell commands follow the shell policy; non-read-only MCP tools require approval by default. To require approval for each main-agent file change:
+`workspace_write` 模式下，工作区内写入自动放行，越界写入直接拒绝。Shell 按其独立策略执行，非只读 MCP 工具默认需审批。若要对主智能体的每次文件修改进行审批：
 
 ```toml
 [permissions]
 workspace_write_require_approval = true
 ```
 
-## Sessions
+默认配置为 `read_only` + `shell = "deny"`。单次运行可覆盖：
 
-Named, project-scoped sessions persist under `~/.morrow/sessions/`:
+```bash
+morrow --permission workspace-write "update the README"
+morrow --allow-shell "run the test suite and explain failures"
+```
+
+## 会话
+
+会话按项目保存在 `~/.morrow/sessions/`：
 
 ```bash
 morrow --session work "continue the refactor"
@@ -208,42 +210,42 @@ morrow session rename work backend-refactor
 morrow session delete backend-refactor
 ```
 
-Useful REPL commands: `/status`, `/permissions ...`, `/compact`, `/reset`, `/exit`. The legacy `--thread` / `--reset-thread` aliases still work; prefer `--session` / `--reset-session`.
+REPL 常用命令：`/status`、`/permissions ...`、`/compact`、`/reset`、`/exit`。兼容别名 `--thread` / `--reset-thread` 仍可用，新用法请优先 `--session` / `--reset-session`。
 
-## Automation
+## 自动化
 
 ```bash
 morrow --jsonl "inspect this crate" > events.jsonl
 ```
 
-JSONL mode requires a prompt and is unavailable in interactive mode or with session subcommands.
+JSONL 模式要求提供提示词，不可用于交互模式或 session 子命令。
 
-## Development
+## 开发
 
-Crate boundaries, turn lifecycle, and extension points: [`ARCHITECTURE.md`](ARCHITECTURE.md).
+crate 边界、turn 生命周期与扩展点见 [`ARCHITECTURE.md`](ARCHITECTURE.md)。
 
-This README covers the Rust workspace in `crates/`. The experimental next-generation runtime has its own [vnext guide](vnext/README.md).
+本文介绍 `crates/` 中的 Rust workspace。下一代运行时实验见独立的 [vnext 文档](vnext/README.md)。
 
 <p align="center">
-  <img src="docs/architecture/architecture-ports.svg" alt="Morrow architecture — core defines ports, adapters implement them" width="720">
+  <img src="docs/architecture/architecture-ports.svg" alt="Morrow 架构 —— 核心定义端口，适配器实现端口" width="720">
 </p>
 
 <details>
-<summary>Workspace crates</summary>
+<summary>Workspace crate 职责</summary>
 
-| Crate | Responsibility |
+| Crate | 职责 |
 | --- | --- |
-| `agent-cli` | CLI, REPL, JSONL, session/hooks commands, server wiring |
-| `agent-config` | Config loading |
-| `agent-core` | Turn execution, ports, middleware, event streams |
-| `agent-eval` | Deterministic regression suite for the agent loop |
-| `agent-hooks` | Command hooks and middleware adapters |
-| `agent-model` | OpenAI-compatible client and streaming |
-| `agent-protocol` | Shared protocol types |
-| `agent-runtime` | Sessions, compaction, workspace, turn helpers |
-| `agent-server` | HTTP/WebSocket browser dashboard |
-| `agent-sandbox` | Permission evaluation |
-| `agent-tools` | Built-in file and shell tools |
+| `agent-cli` | CLI、REPL、JSONL、`session`/`hooks` 子命令与服务装配 |
+| `agent-config` | 配置加载 |
+| `agent-core` | Turn 执行、端口、中间件与事件流 |
+| `agent-eval` | Agent 循环确定性回归套件 |
+| `agent-hooks` | 命令 Hook 与中间件适配器 |
+| `agent-model` | OpenAI 兼容客户端与流式解析 |
+| `agent-protocol` | 共享协议类型 |
+| `agent-runtime` | 会话、压缩、工作区与 turn 辅助 |
+| `agent-server` | HTTP/WebSocket 浏览器仪表盘 |
+| `agent-sandbox` | 权限判定 |
+| `agent-tools` | 内置文件与 shell 工具 |
 
 </details>
 
@@ -252,19 +254,19 @@ cargo build --workspace
 cargo test --workspace
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo run -p agent-eval -- run   # agent loop regression suite
+cargo run -p agent-eval -- run   # agent 循环回归套件
 
 cargo run -p agent-cli -- "hello"
 cargo run -p agent-cli -- server
 ```
 
-Web dashboard development uses Vite's API/WebSocket proxy. Start the local backend in one terminal:
+Web 前端通过 Vite 代理 API 与 WebSocket。先在一个终端启动本地后端：
 
 ```bash
 cargo run -p agent-cli -- server --no-auth
 ```
 
-Then start the frontend in another:
+再在另一个终端启动前端：
 
 ```bash
 cd crates/agent-server/web
@@ -272,18 +274,18 @@ pnpm install --frozen-lockfile
 pnpm dev
 ```
 
-Tagging the workspace version (e.g. `v0.4.0`) triggers GitHub Actions to publish CLI archives and checksums.
+打与 workspace 版本一致的 tag（如 `v0.4.0`）会触发 GitHub Actions 发布 CLI 压缩包与校验文件。
 
-## Uninstall
+## 卸载
 
-Remove the CLI and its bundled search binary from the installation directory:
+从安装目录移除 CLI 与随附的搜索程序：
 
 ```bash
 rm -f ~/.local/bin/morrow ~/.local/bin/morrow-rg
 ```
 
-Local sessions, configuration, and keys remain under `~/.morrow/`. Delete that directory only if you also want to remove those data.
+会话、配置和密钥仍保存在 `~/.morrow/`。如需同时清除这些本地数据，再删除该目录。
 
-## License
+## 许可证
 
 [MIT](LICENSE) © 2026 Gargantua
