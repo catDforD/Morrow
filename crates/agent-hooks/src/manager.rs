@@ -98,7 +98,7 @@ impl HookManager {
         let project_config_path = self.project_config_path();
         let project_hooks = load_hook_file(&project_config_path)?.unwrap_or_default();
         let project_fingerprint = (!project_hooks.is_empty() || project_config_path.is_file())
-            .then(|| hook_fingerprint(&project_hooks))
+            .then(|| hook_fingerprint(&project_hooks, &self.workspace_root))
             .transpose()?;
         let trust = load_trust_store(&self.trust_store_path())?;
         let project_trusted = match project_fingerprint.as_deref() {

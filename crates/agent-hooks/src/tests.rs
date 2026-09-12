@@ -106,7 +106,7 @@ fn config_validates_exact_matchers_timeouts_and_unknown_fields() {
 }
 
 #[test]
-fn project_fingerprint_tracks_definition_order_but_not_script_contents() {
+fn project_fingerprint_tracks_definition_order_and_script_contents() {
     let home = unique_dir("fingerprint-home");
     let workspace = unique_dir("fingerprint-workspace");
     let manager = HookManager::new(&home, &workspace);
@@ -122,8 +122,9 @@ fn project_fingerprint_tracks_definition_order_but_not_script_contents() {
         .expect("first")
         .project_fingerprint
         .expect("fingerprint");
+    // 命令引用的脚本内容是"实际执行的代码"的一部分：改动必须使指纹失效。
     fs::write(&script, "two").expect("change script");
-    assert_eq!(
+    assert_ne!(
         manager
             .settings()
             .expect("after script change")
@@ -140,6 +141,56 @@ fn project_fingerprint_tracks_definition_order_but_not_script_contents() {
         manager
             .settings()
             .expect("reordered")
+            .project_fingerprint
+            .as_deref(),
+        Some(first_fingerprint.as_str())
+    );
+}
+
+#[test]
+fn script_change_after_trust_requires_retrust() {
+    let home = unique_dir("script-trust-home");
+    let workspace = unique_dir("script-trust-workspace");
+    let manager = HookManager::new(&home, &workspace);
+    fs::create_dir_all(workspace.join("scripts")).expect("scripts dir");
+    let script = workspace.join("scripts").join("hook.sh");
+    fs::write(&script, "echo ok").expect("script");
+    write_config(
+        &manager.project_config_path(),
+        "schema_version = 1\n[[hooks]]\nid = \"check\"\nevent = \"before_prompt\"\ncommand = [\"/bin/sh\", \"scripts/hook.sh\"]\n",
+    );
+
+    assert!(manager.trust_project().expect("trust").project_trusted);
+
+    // 审查后改写被引用脚本：必须回到未信任状态，而不是继续执行新代码。
+    fs::write(&script, "echo rewritten").expect("rewrite script");
+    assert!(!manager.settings().expect("after rewrite").project_trusted);
+    manager.trust_project().expect("retrust");
+    assert!(manager.settings().expect("retrusted").project_trusted);
+}
+
+#[test]
+fn fingerprint_ignores_flags_unreferenced_files_and_out_of_workspace_paths() {
+    let home = unique_dir("fingerprint-scope-home");
+    let workspace = unique_dir("fingerprint-scope-workspace");
+    let manager = HookManager::new(&home, &workspace);
+    write_config(
+        &manager.project_config_path(),
+        "schema_version = 1\n[[hooks]]\nid = \"check\"\nevent = \"before_prompt\"\ncommand = [\"/bin/sh\", \"-c\", \"echo done\"]\n",
+    );
+    let first_fingerprint = manager
+        .settings()
+        .expect("first")
+        .project_fingerprint
+        .expect("fingerprint");
+
+    // 未被命令引用的 workspace 文件与 workspace 外路径不影响指纹，
+    // 避免 flags 与数据文件造成无意义的反复失信任。
+    fs::write(workspace.join("unrelated.txt"), "data").expect("unrelated file");
+    assert_eq!(
+        manager
+            .settings()
+            .expect("unrelated file added")
             .project_fingerprint
             .as_deref(),
         Some(first_fingerprint.as_str())
