@@ -151,19 +151,25 @@ async fn access_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let token: &str = match &state.inner.access_policy {
-        ServerAccessPolicy::Browser { token: Some(token) } => token.as_str(),
-        ServerAccessPolicy::Browser { token: None } => {
-            return with_security_headers(next.run(request).await);
-        }
-    };
     let expected_authority = ExpectedAuthority {
         host: state.inner.options.host,
         port: state.inner.options.port,
     };
-    let response = match token_guard(&request, token, expected_authority) {
-        Some(rejection) => rejection,
-        None => next.run(request).await,
+    let response = match &state.inner.access_policy {
+        ServerAccessPolicy::Browser { token: Some(token) } => {
+            match token_guard(&request, token.as_str(), expected_authority) {
+                Some(rejection) => rejection,
+                None => next.run(request).await,
+            }
+        }
+        ServerAccessPolicy::Browser { token: None } => {
+            // no-auth 不等于不设防：Host/Origin 同源校验与 token 模式一致
+            //（仅免去 cookie），否则任意网页可跨站驱动本机 dashboard。
+            match origin_guard(&request, expected_authority) {
+                Some(rejection) => rejection,
+                None => next.run(request).await,
+            }
+        }
     };
 
     with_security_headers(response)
@@ -212,17 +218,29 @@ impl ExpectedAuthority {
     }
 }
 
+/// Host 头必须匹配绑定地址，且需要 Origin 的请求（WS / 写方法）Origin 必须
+/// 同源。返回 `Some(response)` 表示请求被拒绝。
+fn origin_guard(request: &Request<Body>, expected: ExpectedAuthority) -> Option<Response> {
+    if !host_header_matches(request, expected) || !origin_is_allowed(request, expected) {
+        return Some(StatusCode::UNAUTHORIZED.into_response());
+    }
+    None
+}
+
+fn host_header_matches(request: &Request<Body>, expected: ExpectedAuthority) -> bool {
+    request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|host| expected.matches_host_header(host))
+}
+
 fn token_guard(
     request: &Request<Body>,
     token: &str,
     expected: ExpectedAuthority,
 ) -> Option<Response> {
-    let host_matches = request
-        .headers()
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|host| expected.matches_host_header(host));
-    if !host_matches {
+    if !host_header_matches(request, expected) {
         return Some(StatusCode::UNAUTHORIZED.into_response());
     }
     if is_bootstrap_request(request, token) {
