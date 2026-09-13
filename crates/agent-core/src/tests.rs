@@ -2013,7 +2013,7 @@ impl AgentMiddleware for ScriptedAfterTurn {
     }
 }
 
-fn after_turn_context() -> MiddlewareExecutionContext {
+fn test_middleware_context() -> MiddlewareExecutionContext {
     MiddlewareExecutionContext {
         invocation_id: None,
         session: "test".to_string(),
@@ -2039,7 +2039,14 @@ fn after_turn_context() -> MiddlewareExecutionContext {
 
 fn after_turn_run_context() -> AgentRunContext {
     AgentRunContext {
-        middleware: Some(after_turn_context()),
+        middleware: Some(test_middleware_context()),
+        ..AgentRunContext::default()
+    }
+}
+
+fn middleware_run_context() -> AgentRunContext {
+    AgentRunContext {
+        middleware: Some(test_middleware_context()),
         ..AgentRunContext::default()
     }
 }
@@ -2237,4 +2244,317 @@ async fn after_turn_also_gates_wrap_up_completion() {
         *final_texts.lock().expect("final_texts"),
         vec!["partial summary".to_string()]
     );
+}
+
+struct GatedProbeTools {
+    root: PathBuf,
+    release_fast: Arc<tokio::sync::Notify>,
+}
+
+impl ToolRuntime for GatedProbeTools {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        ["fast_probe", "gated_tool"]
+            .into_iter()
+            .map(|name| ToolDefinition::function(name, format!("Test tool {name}"), json!({})))
+            .collect()
+    }
+
+    fn execution_mode(&self, _call: &ToolCall) -> ToolExecutionMode {
+        ToolExecutionMode::Concurrent
+    }
+
+    fn execute(
+        &self,
+        call: ToolCall,
+        approval: Option<ToolApproval>,
+        _context: ToolExecutionContext,
+    ) -> ToolFuture {
+        let release_fast = self.release_fast.clone();
+        let root = self.root.clone();
+        async move {
+            match call.function.name.as_str() {
+                // 兄弟工具：等权限中间件启动后才完成，制造“审批请求先被提升、
+                // 中间件结果后到”的竞态窗口。
+                "fast_probe" => {
+                    release_fast.notified().await;
+                    completed_ok(json!({ "tool": "fast_probe" }), None)
+                }
+                "gated_tool" => {
+                    if approval.is_none() {
+                        return ToolExecution::ApprovalRequired(ApprovalRequest::shell_command(
+                            format!("approval-{}", call.id),
+                            "echo gated",
+                            &root,
+                            5,
+                            "gated tool requires approval",
+                        ));
+                    }
+                    completed_ok(json!({ "tool": "gated_tool" }), None)
+                }
+                name => ToolExecution::error(format!("unknown tool {name:?}")),
+            }
+        }
+        .boxed()
+    }
+}
+
+/// 权限中间件：启动时先放行兄弟工具，再等测试放行后才返回 Continue。
+struct GatedDeferringPermission {
+    release_fast: Arc<tokio::sync::Notify>,
+    finish_permission: Arc<tokio::sync::Notify>,
+}
+
+impl AgentMiddleware for GatedDeferringPermission {
+    fn id(&self) -> &str {
+        "gated-deferring-permission"
+    }
+
+    fn permission_request(
+        &self,
+        _input: PermissionRequestInput,
+    ) -> Option<MiddlewareFuture<PermissionOutput>> {
+        let release_fast = self.release_fast.clone();
+        let finish = self.finish_permission.clone();
+        Some(Box::pin(async move {
+            release_fast.notify_one();
+            finish.notified().await;
+            Ok(PermissionOutput::default())
+        }))
+    }
+}
+
+/// 无条件 Continue 的权限中间件，用于并发审批排队场景。
+/// gated_a 的权限结果刻意等 gated_b 的权限结果先返回，保证两个 Continue
+/// 先后落定之后测试才做人工决策。
+struct OrderedDeferralPermission {
+    second_done: Arc<tokio::sync::Notify>,
+}
+
+impl AgentMiddleware for OrderedDeferralPermission {
+    fn id(&self) -> &str {
+        "ordered-deferral-permission"
+    }
+
+    fn permission_request(
+        &self,
+        input: PermissionRequestInput,
+    ) -> Option<MiddlewareFuture<PermissionOutput>> {
+        let second_done = self.second_done.clone();
+        if input.tool_call.function.name == "gated_a" {
+            Some(Box::pin(async move {
+                second_done.notified().await;
+                Ok(PermissionOutput::default())
+            }))
+        } else {
+            Some(Box::pin(async move {
+                second_done.notify_one();
+                Ok(PermissionOutput::default())
+            }))
+        }
+    }
+}
+
+struct DualApprovalTools {
+    root: PathBuf,
+}
+
+impl ToolRuntime for DualApprovalTools {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        ["gated_a", "gated_b"]
+            .into_iter()
+            .map(|name| ToolDefinition::function(name, format!("Test tool {name}"), json!({})))
+            .collect()
+    }
+
+    fn execution_mode(&self, _call: &ToolCall) -> ToolExecutionMode {
+        ToolExecutionMode::Concurrent
+    }
+
+    fn execute(
+        &self,
+        call: ToolCall,
+        approval: Option<ToolApproval>,
+        _context: ToolExecutionContext,
+    ) -> ToolFuture {
+        let root = self.root.clone();
+        async move {
+            if approval.is_none() {
+                return ToolExecution::ApprovalRequired(ApprovalRequest::shell_command(
+                    format!("approval-{}", call.id),
+                    "echo gated",
+                    &root,
+                    5,
+                    "gated tool requires approval",
+                ));
+            }
+            completed_ok(json!({ "tool": call.function.name }), None)
+        }
+        .boxed()
+    }
+}
+
+/// 带超时的 next_event：回归测试若因 bug 挂起，5 秒后明确失败而不是卡死。
+async fn next_event_within(stream: &mut AgentTurnStream<'_>, label: &str) -> AgentEvent {
+    match tokio::time::timeout(Duration::from_secs(5), next_event(stream)).await {
+        Ok(event) => event,
+        Err(_) => panic!("timed out waiting for {label}"),
+    }
+}
+
+#[tokio::test]
+async fn permission_outcome_tolerates_request_promoted_while_middleware_in_flight() {
+    let root = unique_dir("permission-promoted-request");
+    let release_fast = Arc::new(tokio::sync::Notify::new());
+    let finish_permission = Arc::new(tokio::sync::Notify::new());
+    let first_body = tool_calls_body(vec![
+        ("call_1", "fast_probe", json!({})),
+        ("call_2", "gated_tool", json!({})),
+    ]);
+    let second_body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (base_url, requests) = spawn_recording_sse_server(vec![first_body, second_body]).await;
+    let model = client(base_url);
+    let tools = GatedProbeTools {
+        root: root.clone(),
+        release_fast: Arc::clone(&release_fast),
+    };
+    let mut chain = AgentMiddlewareChain::new();
+    chain.register(Arc::new(GatedDeferringPermission {
+        release_fast: Arc::clone(&release_fast),
+        finish_permission: Arc::clone(&finish_permission),
+    }));
+    let agent = Agent::with_tools(&model, "system", &tools).with_middleware(chain);
+    let mut thread = Thread::new();
+
+    let mut stream = agent
+        .run_turn_with_agent_context(&thread, "run tools", middleware_run_context())
+        .await
+        .expect("run turn");
+
+    // 收集到审批请求为止；兄弟工具必须先完成，审批请求才会被提前提升。
+    let mut saw_fast_finished = false;
+    let request = loop {
+        match next_event_within(&mut stream, "approval request").await {
+            AgentEvent::ToolCallFinished { name, ok: true, .. } if name == "fast_probe" => {
+                saw_fast_finished = true;
+            }
+            AgentEvent::ApprovalRequested(request) => break request,
+            AgentEvent::Error(error) => panic!("unexpected error: {error}"),
+            _ => {}
+        }
+    };
+    assert!(
+        saw_fast_finished,
+        "sibling tool must complete before the approval surfaces"
+    );
+
+    // 此刻审批请求已被提升为 pending_approval，权限中间件仍在飞行。
+    // 修复前：中间件结果到达时结果表项已被取走，expect 直接 panic。
+    finish_permission.notify_one();
+    stream
+        .resolve_approval(ApprovalDecision::approve(request.id.clone()))
+        .expect("resolve approval");
+
+    let mut gated_finished = false;
+    loop {
+        match next_event_within(&mut stream, "turn completion").await {
+            AgentEvent::ToolCallFinished { name, ok: true, .. } if name == "gated_tool" => {
+                gated_finished = true;
+            }
+            AgentEvent::ApprovalRequested(_) => panic!("duplicate approval request"),
+            AgentEvent::Error(error) => panic!("unexpected error: {error}"),
+            AgentEvent::TurnCompleted => break,
+            _ => {}
+        }
+    }
+    assert!(gated_finished);
+    assert_eq!(stream.next().await, None);
+
+    let turn = apply_record(&mut thread, stream.into_turn_record());
+    assert_eq!(turn.status, TurnStatus::Completed);
+    let requests = requests.lock().expect("requests lock poisoned");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("gated_tool"));
+}
+
+#[tokio::test]
+async fn concurrent_permission_deferrals_queue_behind_pending_approval() {
+    let root = unique_dir("concurrent-permission-queue");
+    let first_body = tool_calls_body(vec![
+        ("call_1", "gated_a", json!({})),
+        ("call_2", "gated_b", json!({})),
+    ]);
+    let second_body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"both approved\"},\"finish_reason\":null}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (base_url, requests) = spawn_recording_sse_server(vec![first_body, second_body]).await;
+    let model = client(base_url);
+    let tools = DualApprovalTools { root: root.clone() };
+    let mut chain = AgentMiddlewareChain::new();
+    chain.register(Arc::new(OrderedDeferralPermission {
+        second_done: Arc::new(tokio::sync::Notify::new()),
+    }));
+    let agent = Agent::with_tools(&model, "system", &tools).with_middleware(chain);
+    let mut thread = Thread::new();
+
+    let mut stream = agent
+        .run_turn_with_agent_context(&thread, "run tools", middleware_run_context())
+        .await
+        .expect("run turn");
+
+    // 两个并发审批都要走完 Continue → 人工批准的流程。旧实现里后到的
+    // Continue 会覆盖前一个审批（请求丢失、人工决策得到 mismatch 错误）；
+    // 新实现里第二个请求会排队并发出警告。策略：看到"排队"警告后按到达
+    // 顺序批准（新实现路径）；若两个审批事件未经警告先后出现（旧实现），
+    // 则直接批准第一个，让 mismatch 暴露覆盖缺陷。
+    let mut unresolved = Vec::new();
+    let mut resolved = 0_usize;
+    let mut queued_warning_seen = false;
+    let mut finished = Vec::new();
+    while resolved < 2 {
+        match next_event_within(&mut stream, "approval request").await {
+            AgentEvent::ApprovalRequested(request) => unresolved.push(request),
+            AgentEvent::Warning(text) if text.contains("queued behind the pending approval") => {
+                queued_warning_seen = true;
+            }
+            AgentEvent::ToolCallFinished { id, ok, .. } => finished.push((id, ok)),
+            AgentEvent::Error(error) => panic!("unexpected error: {error}"),
+            _ => {}
+        }
+        let ready_to_resolve =
+            unresolved.len() == 2 || (queued_warning_seen && !unresolved.is_empty());
+        if ready_to_resolve {
+            for request in unresolved.drain(..) {
+                stream
+                    .resolve_approval(ApprovalDecision::approve(request.id.clone()))
+                    .expect("resolve approval");
+                resolved += 1;
+            }
+        }
+    }
+    loop {
+        match next_event_within(&mut stream, "turn completion").await {
+            AgentEvent::ToolCallFinished { id, ok, .. } => finished.push((id, ok)),
+            AgentEvent::ApprovalRequested(_) => panic!("unexpected extra approval request"),
+            AgentEvent::Error(error) => panic!("unexpected error: {error}"),
+            AgentEvent::TurnCompleted => break,
+            _ => {}
+        }
+    }
+    assert_eq!(stream.next().await, None);
+
+    let mut finished_ids: Vec<&str> = finished.iter().map(|(id, _)| id.as_str()).collect();
+    finished_ids.sort_unstable();
+    assert_eq!(finished_ids, ["call_1", "call_2"]);
+    assert!(finished.iter().all(|(_, ok)| *ok));
+
+    let turn = apply_record(&mut thread, stream.into_turn_record());
+    assert_eq!(turn.status, TurnStatus::Completed);
+    let requests = requests.lock().expect("requests lock poisoned");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("gated_a"));
+    assert!(requests[1].contains("gated_b"));
 }

@@ -593,7 +593,17 @@ impl SubagentSupervisor {
     ) {
         let role = match self.document(&instance_id).await {
             Ok(document) => document.snapshot.role,
-            Err(_) => return,
+            Err(error) => {
+                // 不收尾会让实例带着 cancellation 永远阻塞 send/delete/wait。
+                self.finish_without_turn(
+                    &instance_id,
+                    &run_id,
+                    SubagentRunStatus::Failed,
+                    format!("failed to load subagent instance document: {error}"),
+                )
+                .await;
+                return;
+            }
         };
         let writer_permit = if role == SubagentRole::Worker {
             match acquire_permit(self.inner.writer_slot.clone(), &cancellation).await {
@@ -651,7 +661,7 @@ impl SubagentSupervisor {
             .await;
             return;
         }
-        let snapshot = match self
+        match self
             .set_status(
                 &instance_id,
                 &run_id,
@@ -661,14 +671,31 @@ impl SubagentSupervisor {
             )
             .await
         {
-            Ok(snapshot) => snapshot,
-            Err(_) => return,
+            Ok(snapshot) => self.emit_snapshot(snapshot).await,
+            Err(error) => {
+                self.finish_without_turn(
+                    &instance_id,
+                    &run_id,
+                    SubagentRunStatus::Failed,
+                    format!("failed to mark subagent run as running: {error}"),
+                )
+                .await;
+                return;
+            }
         };
-        self.emit_snapshot(snapshot).await;
 
         let document = match self.document(&instance_id).await {
             Ok(document) => document,
-            Err(_) => return,
+            Err(error) => {
+                self.finish_without_turn(
+                    &instance_id,
+                    &run_id,
+                    SubagentRunStatus::Failed,
+                    format!("failed to reload subagent instance document: {error}"),
+                )
+                .await;
+                return;
+            }
         };
         let turn_index = document.session.turns.len();
         let child_cancellation = CancellationToken::new();
@@ -2045,6 +2072,69 @@ mod tests {
             .wait_instances(ids, Duration::from_secs(2))
             .await
             .expect("runs finish");
+        cleanup(supervisor, store_root, workspace);
+    }
+
+    fn instance_document_path(store_root: &Path, instance_id: &str) -> PathBuf {
+        // 布局：<root>/<workspace 哈希>/<session>/<id>.json；测试 session 固定 default。
+        let scope = std::fs::read_dir(store_root)
+            .expect("store root")
+            .next()
+            .expect("scope directory")
+            .expect("scope entry")
+            .path();
+        scope.join("default").join(format!("{instance_id}.json"))
+    }
+
+    /// set_status(Running) 落盘失败时 run 必须终结并释放实例，
+    /// 而不是带着 cancellation 永远阻塞 send/delete/wait。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_status_persist_fails_the_run_and_releases_the_instance() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let model: Arc<dyn Model> = Arc::new(PendingStreamModel::default());
+        let roles = roles_with("persist-fail", |_| model.clone());
+        let (supervisor, store_root, workspace) = test_supervisor("persist-fail", roles);
+
+        let id = supervisor
+            .spawn_instance(SubagentRole::Explore, "task".to_string())
+            .await
+            .expect("spawn instance")
+            .id;
+        let document_path = instance_document_path(&store_root, &id);
+        let directory = document_path
+            .parent()
+            .expect("document parent")
+            .to_path_buf();
+
+        // 入队已成功落盘；让文档目录只读，使后续 set_status 的持久化必然失败。
+        let mut permissions = std::fs::metadata(&directory)
+            .expect("directory metadata")
+            .permissions();
+        permissions.set_mode(permissions.mode() & !0o222);
+        std::fs::set_permissions(&directory, permissions.clone()).expect("read-only directory");
+
+        supervisor
+            .wait_instances(vec![id.clone()], Duration::from_secs(2))
+            .await
+            .expect("wait completes even when the run is stuck");
+        let snapshot = supervisor
+            .snapshots()
+            .await
+            .into_iter()
+            .find(|snapshot| snapshot.id == id)
+            .expect("instance snapshot");
+        assert_eq!(snapshot.status, SubagentInstanceStatus::Failed);
+        assert!(!supervisor.has_active_runs().await);
+
+        let mut writable = permissions;
+        writable.set_mode(writable.mode() | 0o222);
+        std::fs::set_permissions(&directory, writable).expect("restore directory");
+        supervisor
+            .delete(&id)
+            .await
+            .expect("released instance must be deletable");
         cleanup(supervisor, store_root, workspace);
     }
 

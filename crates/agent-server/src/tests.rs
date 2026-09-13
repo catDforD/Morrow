@@ -345,7 +345,9 @@ fn index_references_assets() {
 
 #[tokio::test]
 async fn browser_router_serves_root_and_legacy_asset_paths() {
-    let router = router(test_options()).expect("browser router");
+    let mut options = test_options();
+    options.port = 43101;
+    let router = router(options).expect("browser router");
     for (path, content_type) in [
         ("/app.js", "application/javascript; charset=utf-8"),
         ("/style.css", "text/css; charset=utf-8"),
@@ -357,6 +359,7 @@ async fn browser_router_serves_root_and_legacy_asset_paths() {
             .oneshot(
                 Request::builder()
                     .uri(path)
+                    .header(header::HOST, "127.0.0.1:43101")
                     .body(Body::empty())
                     .expect("asset request"),
             )
@@ -563,20 +566,87 @@ async fn serve_reports_the_bound_address_before_starting() {
 }
 
 #[tokio::test]
-async fn browser_access_without_token_passes_through_for_no_auth() {
+async fn no_auth_browser_access_still_enforces_host_and_origin() {
+    let mut options = test_options();
+    options.port = 43130;
     let (router, _) =
-        build_router(test_options(), ServerAccessPolicy::browser(None)).expect("browser router");
-    let response = router
+        build_router(options, ServerAccessPolicy::browser(None)).expect("browser router");
+
+    let passthrough = router
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/api/status")
+                .header(header::HOST, "127.0.0.1:43130")
                 .body(Body::empty())
                 .expect("request"),
         )
         .await
         .expect("response");
+    assert_eq!(passthrough.status(), StatusCode::OK);
 
-    assert_eq!(response.status(), StatusCode::OK);
+    // Host 与绑定地址不符：DNS rebinding 类请求直接拒绝。
+    let rebound = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/status")
+                .header(header::HOST, "attacker.example:43130")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(rebound.status(), StatusCode::UNAUTHORIZED);
+
+    // 跨站写请求（浏览器会带 Origin）：拒绝。
+    let cross_origin_post = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/commands/resolve")
+                .header(header::HOST, "127.0.0.1:43130")
+                .header(header::ORIGIN, "https://attacker.example")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"input":"hello"}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(cross_origin_post.status(), StatusCode::UNAUTHORIZED);
+
+    // 无 Origin 的写请求与 token 模式同样拒绝（非浏览器客户端需显式带 Origin）。
+    let no_origin_post = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/commands/resolve")
+                .header(header::HOST, "127.0.0.1:43130")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"input":"hello"}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(no_origin_post.status(), StatusCode::UNAUTHORIZED);
+
+    // 同源写请求放行。
+    let same_origin_post = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/commands/resolve")
+                .header(header::HOST, "127.0.0.1:43130")
+                .header(header::ORIGIN, "http://127.0.0.1:43130")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"input":"hello"}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_ne!(same_origin_post.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -829,13 +899,16 @@ async fn session_collection_is_versioned_and_legacy_projection_routes_are_absent
     let _lock = ENV_LOCK.get_or_init(|| AsyncMutex::new(())).lock().await;
     let home = unique_test_dir("collection-home");
     let _home = HomeGuard::set(&home);
-    let router = router(test_options()).expect("router");
+    let mut options = test_options();
+    options.port = 43102;
+    let router = router(options).expect("router");
 
     let empty = router
         .clone()
         .oneshot(
             Request::builder()
                 .uri("/api/sessions")
+                .header(header::HOST, "127.0.0.1:43102")
                 .body(Body::empty())
                 .expect("request"),
         )
@@ -856,6 +929,8 @@ async fn session_collection_is_versioned_and_legacy_projection_routes_are_absent
             Request::builder()
                 .method(Method::POST)
                 .uri("/api/sessions")
+                .header(header::HOST, "127.0.0.1:43102")
+                .header(header::ORIGIN, "http://127.0.0.1:43102")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"name":"task_one"}"#))
                 .expect("request"),
@@ -871,8 +946,10 @@ async fn session_collection_is_versioned_and_legacy_projection_routes_are_absent
                 Request::builder()
                     .method(method)
                     .uri("/api/sessions/task_one")
+                    .header(header::HOST, "127.0.0.1:43102")
+                    .header(header::ORIGIN, "http://127.0.0.1:43102")
                     .body(Body::empty())
-                    .expect("request"),
+                    .expect("legacy request"),
             )
             .await
             .expect("legacy response");
@@ -999,13 +1076,16 @@ async fn corrupt_session_is_reported_without_blocking_other_sessions() {
 
 #[tokio::test]
 async fn static_application_assets_are_never_cached() {
-    let router = router(test_options()).expect("router");
+    let mut options = test_options();
+    options.port = 43103;
+    let router = router(options).expect("router");
     for path in ["/", "/app.js", "/style.css"] {
         let response = router
             .clone()
             .oneshot(
                 Request::builder()
                     .uri(path)
+                    .header(header::HOST, "127.0.0.1:43103")
                     .body(Body::empty())
                     .expect("request"),
             )

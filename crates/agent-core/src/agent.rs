@@ -174,6 +174,16 @@ struct PendingApproval {
     serial: bool,
 }
 
+/// 权限中间件结果到达时，对应审批请求的可能位置。
+enum PermissionRequestLocation {
+    /// 仍在结果表中等待 emit_ready_tool_results 提升。
+    InTable,
+    /// 已被提前提升为 pending_approval，ApprovalRequested 事件已发出。
+    Promoted,
+    /// 已被先到的人工决策消费。
+    Consumed,
+}
+
 pub struct AgentTurnStream<'a> {
     model: &'a dyn Model,
     tools: &'a dyn ToolRuntime,
@@ -690,53 +700,112 @@ impl AgentTurnStream<'_> {
                 }
             },
             ToolCallPhase::Permission(run) => {
-                let request = self
-                    .pending_tool_results
-                    .remove(&index)
-                    .and_then(|(_, execution)| match execution {
-                        ToolExecution::ApprovalRequired(request) => Some(request),
-                        ToolExecution::Completed(_) => None,
-                    })
-                    .expect("permission middleware must retain its approval request");
                 let decision = run.decision();
                 let cancelled = run.cancelled;
                 self.record_middleware_run(index, run.events, run.context);
                 if cancelled {
+                    // 与既有行为一致：取消时丢弃在途审批请求，不落任何工具结果。
+                    self.pending_tool_results.remove(&index);
                     self.active_serial_tool &= !serial;
                     return;
                 }
-                match decision {
-                    PermissionDecision::Deny { reason } => {
-                        self.active_serial_tool &= !serial;
-                        self.finish_tool_execution(
-                            index,
-                            tool_call,
-                            ToolExecution::Completed(ToolResult::error(format!(
-                                "blocked by middleware: {reason}"
-                            ))),
-                        );
-                    }
-                    PermissionDecision::Approve { .. } => {
-                        self.active_serial_tool = true;
-                        self.start_tool_execution(
-                            index,
-                            tool_call,
-                            serial,
-                            Some(ToolApproval {
-                                decision: ApprovalDecision::approve(request.id.clone()),
-                                request,
-                            }),
-                        );
-                    }
-                    PermissionDecision::Continue => {
-                        self.pending_approval = Some(PendingApproval {
-                            index,
-                            tool_call,
-                            request: request.clone(),
-                            serial,
-                        });
-                        self.pending
-                            .push_back(AgentEvent::ApprovalRequested(request));
+                // 请求此刻可能在结果表（常态），可能已被 emit_ready_tool_results
+                // 提前提升为 pending_approval（同批更快的兄弟工具完成时触发），
+                // 也可能已被先到的人工决策消费。三种位置都要正确处理。
+                match self.permission_request_location(index) {
+                    PermissionRequestLocation::InTable => match decision {
+                        PermissionDecision::Deny { reason } => {
+                            self.pending_tool_results.remove(&index);
+                            self.active_serial_tool &= !serial;
+                            self.finish_tool_execution(
+                                index,
+                                tool_call,
+                                ToolExecution::Completed(ToolResult::error(format!(
+                                    "blocked by middleware: {reason}"
+                                ))),
+                            );
+                        }
+                        PermissionDecision::Approve { .. } => {
+                            let request = self
+                                .take_permission_request(index)
+                                .expect("request located in table must be retrievable");
+                            self.active_serial_tool = true;
+                            self.start_tool_execution(
+                                index,
+                                tool_call,
+                                serial,
+                                Some(ToolApproval {
+                                    decision: ApprovalDecision::approve(request.id.clone()),
+                                    request,
+                                }),
+                            );
+                        }
+                        PermissionDecision::Continue => {
+                            if self.pending_approval.is_none() {
+                                let request = self
+                                    .take_permission_request(index)
+                                    .expect("request located in table must be retrievable");
+                                self.pending_approval = Some(PendingApproval {
+                                    index,
+                                    tool_call,
+                                    request: request.clone(),
+                                    serial,
+                                });
+                                self.pending
+                                    .push_back(AgentEvent::ApprovalRequested(request));
+                            } else {
+                                // 审批槽被占：请求留在结果表排队，等槽空出后由
+                                // emit_ready_tool_results 提升，不能覆盖丢请求。
+                                self.pending.push_back(AgentEvent::Warning(
+                                    "approval request queued behind the pending approval"
+                                        .to_string(),
+                                ));
+                            }
+                        }
+                    },
+                    PermissionRequestLocation::Promoted => match decision {
+                        PermissionDecision::Deny { reason } => {
+                            self.pending_approval = None;
+                            self.active_serial_tool &= !serial;
+                            self.finish_tool_execution(
+                                index,
+                                tool_call,
+                                ToolExecution::Completed(ToolResult::error(format!(
+                                    "blocked by middleware: {reason}"
+                                ))),
+                            );
+                        }
+                        PermissionDecision::Approve { .. } => {
+                            let request = self
+                                .take_permission_request(index)
+                                .expect("promoted request must be held by the approval slot");
+                            self.active_serial_tool = true;
+                            self.start_tool_execution(
+                                index,
+                                tool_call,
+                                serial,
+                                Some(ToolApproval {
+                                    decision: ApprovalDecision::approve(request.id.clone()),
+                                    request,
+                                }),
+                            );
+                        }
+                        // 审批请求已在审批槽等待人工决策，事件已发出。
+                        PermissionDecision::Continue => {}
+                    },
+                    PermissionRequestLocation::Consumed => {
+                        // 人工决策已先行处理该请求，以人工决策为准；
+                        // 中间件的否决/批准与人工决策冲突时提示操作者。
+                        let late_decision = match decision {
+                            PermissionDecision::Continue => None,
+                            PermissionDecision::Deny { .. } => Some("denial"),
+                            PermissionDecision::Approve { .. } => Some("approval"),
+                        };
+                        if let Some(late_decision) = late_decision {
+                            self.pending.push_back(AgentEvent::Warning(format!(
+                                "permission middleware {late_decision} arrived after the approval was already resolved; ignoring the late middleware decision"
+                            )));
+                        }
                     }
                 }
             }
@@ -758,6 +827,35 @@ impl AgentTurnStream<'_> {
                 self.finish_tool_execution(index, tool_call, ToolExecution::Completed(result));
             }
         }
+    }
+
+    /// 定位权限中间件对应的审批请求（非破坏性，只探测不取走）。
+    fn permission_request_location(&self, index: usize) -> PermissionRequestLocation {
+        if matches!(
+            self.pending_tool_results.get(&index),
+            Some((_, ToolExecution::ApprovalRequired(_)))
+        ) {
+            return PermissionRequestLocation::InTable;
+        }
+        if self.pending_approval.as_ref().map(|pending| pending.index) == Some(index) {
+            return PermissionRequestLocation::Promoted;
+        }
+        PermissionRequestLocation::Consumed
+    }
+
+    /// 取回权限中间件对应的审批请求：优先从结果表取；表项可能已被
+    /// emit_ready_tool_results 提前提升为 pending_approval，此时从审批槽取。
+    /// 返回 None 表示请求已被先到的审批决策消费。
+    fn take_permission_request(&mut self, index: usize) -> Option<ApprovalRequest> {
+        if let Some((_, ToolExecution::ApprovalRequired(request))) =
+            self.pending_tool_results.remove(&index)
+        {
+            return Some(request);
+        }
+        if self.pending_approval.as_ref().map(|pending| pending.index) == Some(index) {
+            return self.pending_approval.take().map(|pending| pending.request);
+        }
+        None
     }
 
     fn record_middleware_run(
