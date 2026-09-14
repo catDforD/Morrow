@@ -12,3 +12,5 @@ docs/*
 !docs/architecture/
 docs/architecture/*
 !docs/architecture/architecture-ports.svg
+# 源码学习笔记(docs/source-walkthrough 分支)
+!docs/study/
