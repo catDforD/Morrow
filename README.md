@@ -179,7 +179,7 @@ JSONL mode requires a prompt and is unavailable in interactive mode or with sess
 
 ## Development
 
-Crate boundaries, turn lifecycle, and extension points: [`ARCHITECTURE.md`](ARCHITECTURE.md).
+[Architecture](ARCHITECTURE.md) · [Project status](STATUS.md) · [Architecture decisions (ADR)](docs/adr/README.md).
 
 <p align="center">
   <img src="docs/architecture/architecture-ports.svg" alt="Morrow architecture — core defines ports, adapters implement them" width="720">

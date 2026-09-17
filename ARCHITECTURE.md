@@ -1,417 +1,91 @@
-# Morrow Agent 架构
+# Morrow 架构
 
-本文面向刚接触 Rust 和 agent 工程的开发者，说明 Morrow 当前重构后的分层、依赖方向和主要扩展点。这里描述的是仓库正在落地的端口架构，不包含尚未实现的分布式会话协调或强制终止所有外部进程等能力。运行时一致性协议（Session fact log、事件与订阅）见 [`docs/session-consistency-protocol.md`](docs/session-consistency-protocol.md)，确定性回归评估见 [`crates/agent-eval/README.md`](crates/agent-eval/README.md)。
+> 核对日期：2026-09-17。本文只描述当前实现，不作为功能待办。
+> [项目状态](STATUS.md) · [架构决策](docs/adr/README.md) · [Session 一致性协议](docs/session-consistency-protocol.md)
 
-## 1. 先理解三个概念
+## 1. 一张地图
 
-### 1.1 Crate 是什么
-
-Rust workspace 由多个 crate 组成。一个 crate 通常对应一个相对独立的职责边界，并拥有自己的 `Cargo.toml`。拆分 crate 的主要目的不是让目录变多，而是让编译依赖明确：上层可以依赖下层，下层不能反过来知道上层的具体实现。
-
-### 1.2 端口和适配器是什么
-
-端口是核心逻辑需要的能力接口，通常使用 Rust trait 表达。例如，agent 核心只需要“可以流式调用模型”，因此在 `agent-core` 中定义 `Model` trait。
-
-适配器是端口的具体实现。例如，`OpenAiCompatClient` 实现 `Model`，负责 HTTP 请求和 SSE 解析。核心状态机只依赖 `dyn Model`，不需要知道 OpenAI-compatible API 的 URL、鉴权方式或响应格式。
-
-依赖关系因此从：
+Morrow 是本地 coding agent：CLI 与浏览器共用运行时，运行时装配模型、工具和会话，核心状态机推进一次用户请求。
 
 ```text
-core -> OpenAI 客户端
-```
-
-调整为：
-
-```text
-core <- Model trait 的实现 <- OpenAI 客户端
-```
-
-trait 由核心层拥有，具体适配器依赖并实现它，这就是依赖倒置。
-
-### 1.3 Turn、Thread 和 Session 的区别
-
-- `Turn`：一次用户输入到本次 agent 执行结束的状态，包括模型步骤、工具步骤和错误。
-- `Thread`：下一次模型调用实际会看到的消息上下文。
-- `Session`：可持久化的完整会话，包含活动上下文、所有 turn 的审计历史和压缩摘要状态。
-
-## 2. 总体分层
-
-```text
-┌─────────────────────────────────────────────────────────────┐
-│ 入口层                                                      │
-│ agent-cli                 agent-server                      │
-│ 参数、REPL、JSONL          HTTP、WebSocket、Web UI           │
-└──────────────────────────────┬──────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 应用编排层：agent-runtime                                   │
-│ 运行一次 turn、上下文压缩、事件封装、SessionStore、MCP 装配 │
-└──────────────────────────────┬──────────────────────────────┘
-                               │ 注入端口实现
-                               ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 核心层：agent-core                                          │
-│ Agent turn 状态机、Model 端口、ToolRuntime 端口、中间件链    │
-└───────────────────┬───────────────────────┬─────────────────┘
-                    ▲                       ▲
-                    │ implements            │ implements
-┌───────────────────┴──────────┐  ┌─────────┴─────────────────┐
-│ agent-model                  │  │ agent-tools               │
-│ OpenAI-compatible + SSE      │  │ 内置工具、ToolRegistry、MCP│
-└──────────────────────────────┘  └──────────────┬────────────┘
-                                                 │
-                                                 ▼
-                                       ┌──────────────────────┐
-                                       │ agent-sandbox        │
-                                       │ 路径与权限策略判断   │
-                                       └──────────────────────┘
-
-agent-protocol 位于底部，向各层提供共享数据类型。
-agent-config 负责把配置文件和环境变量转换成类型安全的配置。
-agent-hooks 是策略适配器：实现核心中间件接口，依赖 core/runtime/protocol。
-agent-eval 是验证层：依赖 core/protocol，用脚本化模型与工具固定循环不变量，
-不进入生产运行时。
-```
-
-## 3. 各 crate 的职责
-
-| Crate | 主要职责 | 不应该承担的职责 |
-| --- | --- | --- |
-| `agent-protocol` | `Message`、`ToolCall`、`Turn`、Session fact、审批和事件等共享类型 | HTTP、文件访问、模型调用和业务编排 |
-| `agent-core` | turn 状态机、`Model` / `ToolRuntime` 两个核心端口和中间件链 | OpenAI HTTP、MCP transport、CLI 和持久化 |
-| `agent-model` | OpenAI-compatible 请求、SSE 解析，实现 `Model` | Session 写入、工具调度和 UI 事件处理 |
-| `agent-tools` | 内置工具、工具注册、MCP 工具适配，实现 `ToolRuntime` | 决定一整个 turn 的状态流转 |
-| `agent-sandbox` | workspace 路径约束和权限决策 | 直接执行模型或管理 Session |
-| `agent-runtime` | 编排已注入的模型端口与工具系统、上下文压缩、turn 事件封装、SessionStore 与 v7 fact log 持久化、Subagent 监督 | 解析 CLI 参数、实现模型 HTTP 协议或渲染 Web UI |
-| `agent-config` | 加载并校验 `morrow.toml` 和环境变量 | 执行 agent turn |
-| `agent-cli` | CLI 参数、REPL、终端输出、交互式审批、`session` / `hooks` 子命令和服务装配 | 复制核心状态机或实现会话持久化 |
-| `agent-server` | HTTP/WebSocket API、浏览器事件、审批和取消入口 | 实现模型协议或工具业务 |
-| `agent-hooks` | 命令 Hook 与中间件适配器、项目 Hook 指纹信任 | 修改 turn 状态机或实现 HTTP |
-| `agent-eval` | 确定性回归场景、脚本化模型与工具、效率基线 | 参与生产运行时或依赖真实模型 |
-
-## 4. 编译依赖方向
-
-箭头 `A -> B` 表示 A 的代码可以导入 B：
-
-```text
-agent-cli    -> agent-hooks, agent-runtime, agent-server, agent-model, agent-config, agent-protocol
-agent-server -> agent-hooks, agent-runtime, agent-model, agent-config, agent-protocol
-agent-runtime-> agent-core, agent-tools, agent-model, agent-config, agent-protocol
-agent-hooks  -> agent-core, agent-runtime, agent-protocol
-agent-eval   -> agent-core, agent-protocol
-
-agent-model  -> agent-core, agent-protocol
-agent-tools  -> agent-core, agent-sandbox, agent-config, agent-protocol
-agent-sandbox-> agent-protocol
-agent-config -> agent-protocol
-agent-core   -> agent-protocol
-agent-protocol -> serde / serde_json
-```
-
-最重要的约束是：
-
-1. `agent-core` 定义端口，但不依赖 `agent-model` 或 `agent-tools` 的具体类型。
-2. `agent-model` 和 `agent-tools` 依赖 `agent-core`，分别实现端口。
-3. `agent-cli` 和 `agent-server` 是模型适配器的组合根；它们创建客户端，再以 `dyn Model` 注入 runtime。
-4. `agent-runtime` 负责用例编排和工具系统装配，但不知道具体模型供应商。
-5. `agent-protocol` 不反向依赖任何业务 crate。
-6. `agent-eval` 和 `agent-hooks` 可以依赖 `agent-core`，但 `agent-core` 不反向感知它们；`agent-eval` 绝不进入生产运行时。
-
-以后增加模型供应商或工具运行时，通常不需要修改 turn 状态机。
-
-## 5. 核心端口
-
-### 5.1 模型端口
-
-`agent-core` 中的模型边界可以简化理解为：
-
-```rust
-pub trait Model: Send + Sync {
-    fn stream(&self, request: ModelRequest) -> ModelFuture;
-}
-```
-
-`ModelRequest` 包含本次对话和工具定义。模型通过流返回四种核心事件：
-
-- `ReasoningDelta`：一段增量推理内容（可选，写入最终 assistant message）。
-- `TextDelta`：一段增量文本。
-- `ToolCalls`：模型请求调用一个或多个工具。
-- `Completed`：本轮模型流正常结束。
-
-`OpenAiCompatClient` 是当前适配器。它把 `ModelRequest` 转成 Chat Completions HTTP 请求，再把 SSE 数据转换成核心层认识的 `ModelEvent`。
-
-这里使用 `BoxFuture` 和 `BoxStream`，是因为不同适配器产生的 async future 和 stream 具有不同、通常无法直接写出的具体类型。装箱后，`AgentTurnStream` 可以用统一类型持有它们，并跨多次 `poll` 推进状态机。
-
-### 5.2 工具运行时端口
-
-核心层看到的是较粗粒度的 `ToolRuntime`：
-
-```rust
-pub trait ToolRuntime: Send + Sync {
-    fn definitions(&self) -> Vec<ToolDefinition>;
-    fn execution_mode(&self, call: &ToolCall) -> ToolExecutionMode;
-    fn execute(
-        &self,
-        call: ToolCall,
-        approval: Option<ToolApproval>,
-        context: ToolExecutionContext,
-    ) -> ToolFuture;
-}
-```
-
-它回答三个问题：有哪些工具、这个调用能否并发、如何执行调用。`ToolExecutionContext` 当前携带本次 turn 的取消信号；以后增加 trace id 或 deadline 时，也可以继续通过这个上下文传递，而不污染每个工具的业务参数。
-
-`agent-tools::ToolRegistry` 实现该端口。Registry 内部还有更细粒度的 `Tool` trait，供单个内置工具组或 MCP 适配器实现。两层 trait 的职责不同：
-
-- `ToolRuntime` 是 core 与整个工具系统之间的端口。
-- `Tool` 是 tools crate 内部的插件接口。
-
-读操作通常标记为 `Concurrent`，写文件和 shell 等有副作用的操作标记为 `Serial`。core 最多并发执行四个可并发调用，但会按照模型原始 tool call 顺序把结果写回对话，避免并发完成顺序改变模型语义。
-
-## 6. 一次 turn 的完整时序
-
-```text
-CLI / Server
+CLI / Web                        接收输入、展示事件、审批与取消入口
     │
-    │ prompt + Session 投影 + 配置
     ▼
-agent-runtime
-    │ 1. 构建内置工具并发现 MCP 工具
-    │ 2. 连同工具 schema 估算上下文并按需压缩
-    │ 3. 把 Model 与 ToolRuntime 注入 Agent
-    ▼
-agent-core::Agent
-    │ 4. system prompt + active_thread + user message
-    ▼
-dyn Model
-    │ 5. ReasoningDelta / TextDelta / ToolCalls / Completed
-    ▼
-AgentTurnStream
-    │ 6. 如有工具调用，交给 dyn ToolRuntime
-    │ 7. 如需审批，暂停并发批次，发出 ApprovalRequested
-    │ 8. 工具结果写回对话，再次调用模型
-    │ 9. 默认最多 99 轮工具调用（Subagent 按角色配置 1–99），
-    │    超过后 turn 显式失败并记录错误
-    ▼
-TurnRecord + AgentEvent
-    │ 10. runtime 校验并转换 turn 事实
-    ▼
-agent-runtime / SessionStore
-    │ 11. 追加 v7 Session fact log 并 sync
-    ▼
-CLI 输出或 WebSocket 广播
-```
-
-更具体地说：
-
-1. 入口层加载配置和 Session 投影，并确定 workspace root 与权限档位。
-2. runtime 创建 `ToolRegistry`。MCP 启动或发现失败会形成 warning，而不是让所有可用工具一起失效。
-3. runtime 把工具 schema 也计入 token 估算，再决定是否执行上下文压缩。
-4. core 创建 `Conversation`，其中 system prompt 不写入长期 Thread。
-5. 模型文本一边到达，一边发出 `TextDelta`，入口层可以实时显示。
-6. 模型请求工具时，core 先记录 assistant tool-call message，再调度工具。
-7. 工具结果被转换成 `tool` role message，随后进入下一次模型调用。
-8. 最终文本形成 assistant message，并生成完成的 `TurnRecord`。
-9. runtime 按副作用顺序把 `TurnStarted`、模型/工具事实与终态事实追加进 v7 fact log；只有已完成的 turn 消息才进入后续模型上下文。
-
-事件展示和 Session 持久化是两个概念。`AgentEvent` 用于实时观察执行过程，v7 Session fact 才是会话历史的持久化事实。
-
-事件接收方失败也不会回滚已经发生的领域事实：若投递在 turn 中途失败，runtime 会取消执行并提交一个 `Failed` record；若 turn 已经完成，则仍提交 `Completed` record，并通过 `RunAgentTurnOutcome.error` 把投递错误返回给入口层。这样 stdout/JSONL/WebSocket 的观察故障不会造成“副作用已经发生但 Session 没有审计记录”。
-
-## 7. Session 与 Turn 不变量
-
-当前运行时的唯一持久化事实源是 append-only v7 fact log（见第 12 节和 `docs/session-consistency-protocol.md`）。`agent-protocol::Session` 是聚合投影类型，用于旧 v1–v4 数据迁移和导出兼容；下面的不变量对聚合投影与 fact 投影同时成立。
-
-### 7.1 Session 聚合投影的三个部分
-
-聚合 Session 文档（当前 schema v7）保持下面的 JSON 结构：
-
-```text
-Session
-├── active_thread: Thread
-├── turns: Vec<TurnRecord>
-└── context: SessionContext
-    ├── summary: Option<String>
-    └── summarized_turns: usize
-```
-
-各字段含义如下：
-
-- `active_thread` 是下一次模型会看到的活动上下文，不是完整审计日志。
-- `turns` 保存所有完成或失败的 turn，供恢复、展示和排查错误。
-- `context` 记录压缩摘要，以及历史中已经被摘要覆盖的前缀长度。
-
-这些字段仍然公开，供旧文档迁移与导出使用。业务代码不应分别手动 `push`，而应使用 `Session::apply_turn(record)`；运行时持久化路径则通过 `SessionHandle` 追加 fact，再由纯投影器生成同样的结构。
-
-`apply_turn` 的规则是：
-
-```text
-Completed -> record.messages 追加到 active_thread，然后 record 追加到 turns
-Failed    -> active_thread 不变，只把 record 追加到 turns
-```
-
-这样失败 turn 会留在审计历史中，但不会污染下一次模型上下文。`Session::try_apply_turn` 会拒绝 `Running` record；`Running` 只属于执行期，不能作为最终记录保存。
-
-### 7.2 Turn 的状态约束
-
-- `Running`：turn 正在执行，最后一个 step 通常也是 `Running`。
-- `Completed`：存在最终 `assistant_message`，`error` 为空，最后一个模型 step 已完成。
-- `Failed`：`error` 有值，活动 Thread 不应追加该 turn 的 messages。
-
-`TurnStep` 描述一次模型调用或一次工具调用。一个整体完成的 turn 内部仍可能存在失败的工具 step，例如工具返回错误后，模型理解该错误并给出最终答复。
-
-### 7.3 TurnRecord.messages 的含义
-
-`TurnRecord.messages` 只保存本 turn 产生的消息链，可能包含：
-
-```text
-user
-assistant(tool_calls)
-tool(result)
-assistant(final answer)
-```
-
-这些消息既用于审计，也用于成功 turn 的活动上下文更新。不要只保存最终 assistant 文本，否则下一轮模型会丢失工具调用和工具结果之间的对应关系。
-
-### 7.4 上下文压缩约束
-
-压缩不会删除 `turns`，只改变模型活动上下文：
-
-```text
-active_thread = summary system message
-              + 尚未摘要的 Completed turn messages
-```
-
-`summarized_turns` 是 turn 数组中的前缀边界，不是消息数量。失败 turn 可以被摘要覆盖，但不会直接重新加入 active Thread。在 fact log 中，同一事实由 `ContextCompacted { summary, covered_through_turn_id }` 表达。
-
-## 8. 如何扩展模型
-
-增加新模型适配器时：
-
-1. 在 `agent-model` 或新的模型适配器 crate 中创建客户端类型。
-2. 为该类型实现 `agent_core::Model`。
-3. 把供应商特有响应转换为 `TextDelta`、`ToolCalls` 和 `Completed`。
-4. 把供应商错误包装成 `ModelFailure`，不要让 provider-specific error 进入 core。
-5. 在 CLI、server 或新的入口组合根中选择并注入该实现。
-6. 为请求映射、流结束、空流、工具调用和错误流添加适配器测试。
-
-如果供应商不使用 OpenAI 消息格式，转换逻辑仍应留在适配器中，而不是给 core 增加供应商分支。
-
-## 9. 如何扩展工具
-
-增加本地工具时：
-
-1. 实现 `agent_tools::Tool`。
-2. 提供稳定且唯一的 `ToolDefinition` 名称和 JSON Schema。
-3. 根据副作用选择 `Concurrent` 或 `Serial`。
-4. 使用结构化参数反序列化，不手工拼接 JSON 字符串。
-5. 在产生文件、shell 或其他外部副作用前完成权限与审批判断。
-6. 返回结构化 `ToolResult`，必要时提供 `ToolExecutionSummary` 给 CLI/Web 展示。
-7. 注册到 `ToolRegistry`，重复名称会被拒绝。
-
-MCP 工具也会被包装成 `Tool` 并注册，因此 core 不需要区分“内置工具”和“MCP 工具”。需要注意，`agent-sandbox` 当前主要保护本地内置文件和 shell 工具；外部 MCP server 的能力边界还取决于该 server 自己的实现和配置。
-
-## 10. 审批边界
-
-审批由工具和权限策略触发，core 只负责暂停和恢复状态机：
-
-```text
-ToolRuntime.execute(call, None)
+agent-runtime                    上下文准备、工具装配、会话持久化、子代理监督
     │
-    ├── Completed(result) ───────────────> 继续
-    │
-    └── ApprovalRequired(request)
-            │
-            ▼
-       AgentEvent::ApprovalRequested
-            │
-            ▼
-       TurnEventHandler::resolve_approval
-            │
-            ├── deny    -> 生成 approval denied 工具结果
-            └── approve -> execute(call, Some(ToolApproval))
+    ▼
+agent-core                       模型／工具循环、调度、审批恢复、中间件
+    ├── Model 端口       ← agent-model：OpenAI-compatible HTTP / SSE
+    └── ToolRuntime 端口 ← agent-tools：内置工具 / MCP
+                                  └── agent-sandbox：路径与权限判断
+
+agent-protocol：共享数据类型     agent-config：配置加载与校验
+agent-hooks：中间件适配器        agent-eval：确定性回归，不进入生产运行时
 ```
 
-CLI 可以在终端询问用户；server 使用 WebSocket 接收浏览器决定。core 会校验 `request_id`，错误或过期的决定不能应用到另一个审批请求。
+**依赖原则：core 定义接口，适配器实现接口。** core 不依赖具体模型客户端、工具实现、CLI 或文件存储。CLI/server 创建模型客户端并注入 runtime；换模型或新增工具，通常不需要改 turn 状态机。
 
-审批不是操作系统级沙箱，也不是事务回滚：
+## 2. 一次请求怎样完成
 
-- 它必须发生在副作用之前。
-- 工具实现必须验证批准的 request 与当前调用匹配。
-- 新增有副作用的工具时，不能仅依赖 UI 提示文本保证安全。
-- `DangerFullAccess` 会按当前策略放宽本地文件和 shell 限制，应当显式使用。
+1. **准备**：入口加载配置和 Session；runtime 准备项目指令、权限、工具定义及中间件，并按需压缩上下文。
+2. **调用模型**：core 将系统提示、活动历史和本次输入组成模型请求，逐步输出文本事件。
+3. **调用工具**：模型返回结构化工具调用；core 调度工具，必要时等待审批，将结果写回对话，再调用模型。
+4. **收尾**：模型给出最终回答后，`after_turn` 中间件可接受、要求继续或判定失败；错误、取消和上限也会结束执行。
+5. **记录与展示**：runtime 在执行过程中将相应事件转换为持久化事实，并向 CLI/Web 分发事件；结束时收束 turn。
 
-## 11. 取消边界
+实现是 `AgentTurnStream`，不是后台自动运行的黑盒：runtime 持续轮询它，它保存正在等待的模型流、工具 future、审批和待发事件。
 
-Web server 按 `session + turn_id` 识别运行中的 turn。取消采用协作式 `CancellationToken`，信号会传到 runtime、core 和工具层；同一 Session 的运行槽位会一直保留到 worker 真正退出。若五秒后仍未收束，server 才使用 Tokio abort 兜底，并在 task future 已被 drop 后释放槽位。
+调度约束：可并发工具最多同时执行 4 个，结果按模型原始调用顺序回灌；串行工具形成调度屏障。默认最多 99 轮工具调用，`after_turn` 最多接受 3 次继续请求。turn 内上下文超限时，尝试一次不带工具的总结调用。
 
-各层的实际语义如下：
+## 3. 状态与持久化
 
-- core 生命周期：未完成的 `AgentTurnStream` 被提前 drop 时会自动触发取消，避免事件处理器报错等提前返回路径留下后台工具。
-- 模型请求或模型流：core 停止轮询并丢弃对应 future/stream；本地 HTTP 等待会停止，但远端服务已经收到的请求仍可能继续执行。
-- 审批等待：立即停止等待，并把当前 turn 收束为 `Failed`。
-- 文件变更：事务开始前检查取消；一旦提交阶段已经开始，就继续完成提交或回滚，避免留下半写状态。已经完整提交的旧操作不会因之后取消而撤销。
-- shell：Unix 下每次命令使用独立进程组。timeout 或工具 future 仍在被轮询并观察到取消时，会终止进程组并异步等待根进程及 stdout/stderr 管道收束；future 被直接 drop 时，RAII guard 会同步发送 killpg，但无法在 `Drop` 中等待或回报清理错误。Windows 当前只能尽力终止根 shell，尚不具备等价的进程树保证。
-- MCP：调用方在取消后立即返回，尚在 actor 队列中的调用会在执行前跳过；已经发出的远端操作是否停止，仍取决于 MCP server 和 transport。
-- `spawn_blocking` 文件任务：future 被丢弃不会强制终止线程，因此提交前取消检查和事务边界仍然是必要保护。
-
-取消不是通用回滚协议。工具仍应把审批放在副作用之前，并明确区分“可取消等待”和“必须原子收束的提交”。
-
-CLI 没有独立的 turn cancellation 协议；进程级中断仍属于入口层行为。
-
-## 12. Session 持久化与事件协议
-
-`agent-runtime::SessionStore` 把 Session 保存为 append-only JSONL fact log。当前 canonical header 是 schema v7（`SESSION_DOCUMENT_SCHEMA_VERSION = 7`），并接受 v5/v6 header（就地升级 header，不重写 facts）。旧的 v1/v2 Thread 文档和 v3/v4 Session 聚合文档只作为迁移输入；迁移产生 `LegacyContextCheckpoint` / `ContextCompacted` 等 fact 后即安装 v7 log，旧源原子移动为 `.legacy-vN.bak`。聚合 `SessionDocument`（schema v7）仅用于迁移与导出兼容，不作为运行时模型上下文的事实源。一致性细节见 [`docs/session-consistency-protocol.md`](docs/session-consistency-protocol.md)。
-
-每次 turn 的 runtime 上下文必须携带解析后的 `ModelInvocation`，并在 Turn 创建时写入记录；Web 与 CLI 入口不得在持久化后各自补写模型信息。这样实时展示和历史恢复都以同一份模型元数据为准。
-
-实时事件使用当前 schema v8 的 `AgentEventEnvelope`（`agent-runtime::EVENT_SCHEMA_VERSION = 8`）包装，包含：
-
-- 事件 schema version。
-- Session 名称和 workspace root。
-- turn index 和 event index。
-- 时间戳与具体 `AgentEvent`。
-
-Session 订阅流当前为 schema v3（`SESSION_STREAM_SCHEMA_VERSION = 3`）。CLI 的 JSONL 和 server 的浏览器 WebSocket 共用 `AgentEventEnvelope`。修改任何事件/订阅 JSON 形状或版本号时，都需要把它当作外部协议变更，而不是普通内部重构。
-
-父模型每次真实开始请求时都会发送 `model_call_started`。Web 以该事件创建模型步骤，工具和 Subagent 的开始事件只结束当前模型步骤，不再自行推断新的模型调用；因此同一批并发工具不会产生重复的模型行。
-
-Subagent 身份遵守同样的单一来源规则：父 turn 启动时把 `SubagentIdentity { id, name }` 名单快照写入 `RunAgentTurnContext`，`ToolRegistry` 再按 tool-call ID 缓存随机分配结果，保证开始事件、结束事件和持久化工具结果使用同一身份。完整的姓名与头像配置由 `agent-server` 保存在全局 `~/.morrow/subagents.json`；协议和 Session 只携带 ID/姓名，不携带 Base64 头像。
-
-当前 SessionStore 是本地文件存储。SessionHandle 使用标准库跨进程文件锁保证单写者；server 还会在进程内阻止同一 Session 同时启动两个 turn。多个独立进程通过文件锁排队获取写租约，但不要绕过 `SessionHandle` 直接改写 fact log。
-
-## 13. 新代码应该放在哪里
-
-| 需求 | 推荐位置 |
+| 概念 | 含义 |
 | --- | --- |
-| 新增共享消息、turn、审批或事件类型 | `agent-protocol` |
-| 修改模型/工具循环和 turn 状态机 | `agent-core` |
-| 新增模型 HTTP 协议或流解析 | `agent-model` |
-| 新增内置工具或 MCP 适配 | `agent-tools` |
-| 修改路径约束和权限策略 | `agent-sandbox` |
-| 修改上下文压缩、SessionStore 或一次 turn 的应用编排 | `agent-runtime` |
-| 新增配置字段和校验 | `agent-config` |
-| 修改参数、REPL 或终端输出 | `agent-cli` |
-| 修改 HTTP、WebSocket 或 Web UI | `agent-server` |
-| 新增命令 Hook 或中间件策略 | `agent-hooks` |
-| 新增回归场景、断言或效率预算 | `agent-eval` |
+| `Thread` | 下一次模型调用使用的活动消息历史 |
+| `Turn` / `TurnRecord` | 一次用户请求的执行状态，以及该次产生的消息链 |
+| `Session` | 完整会话的聚合投影：活动上下文、turn 历史和压缩状态 |
 
-判断位置时可以问两个问题：
+必须保持的不变量：
 
-1. 这段代码描述的是稳定业务规则，还是某个外部系统的接入细节？
-2. 替换模型、工具或 UI 后，这段代码是否仍然成立？
+- **成功与失败分开**：成功 turn 的消息进入活动上下文；失败 turn 保留审计记录，但不直接追加到活动上下文。
+- **消息链完整**：保留 user、assistant 工具调用、tool 结果和最终回答，不能只保存最终文本。
+- **压缩不是删除历史**：压缩改变模型可见上下文，不删除完整审计历史。
+- **事实与展示分开**：Session fact log 是持久化事实源；实时事件流不是另一份独立会话真相。
+- **单写者**：通过 `SessionHandle` 和跨进程文件锁追加事实，不绕过它直接改日志。
 
-稳定的 turn 规则放在 core；可替换的外部细节放在适配器；跨组件用例编排放在 runtime。
+当前 Session fact log 为 v7，事件 envelope 为 v8，Session 订阅流为 v3。协议变更、迁移和恢复细节以 [Session 一致性协议](docs/session-consistency-protocol.md) 为准；类型的 JSON 形状也是外部契约。
 
-## 14. 分层测试策略
+## 4. 权限、取消与子代理边界
 
-- `agent-core`：使用假的 `Model` 和 `ToolRuntime`，验证纯状态机、并发顺序、轮次上限和审批恢复。
-- `agent-model`：验证 HTTP 请求与 SSE 到 `ModelEvent` 的转换。
-- `agent-tools`：验证参数、路径、权限、副作用前审批和结构化结果。
-- `agent-runtime`：验证压缩、事件 envelope、fact 追加顺序、恢复与迁移时机。
-- `agent-server`：验证同 Session 的运行限制、审批 request id、取消和 WebSocket 消息。
-- `agent-protocol`：锁定 Session v7 fact/文档、Session stream v3、事件和消息的 JSON 契约。
-- `agent-eval`：以脚本化模型和脚本化工具端到端运行真实 turn 循环，锁定工具结果回灌、错误传播、审批、轮次上限、消息链和效率预算；CI 通过 `cargo run -p agent-eval -- run` 执行。
+审批必须发生在副作用之前，并校验请求身份；它不是操作系统级沙箱。取消是协作式停止，**不是撤销整个 turn 的副作用**。已提交的文件修改不会因后续失败自动恢复；远端模型与 MCP 操作能否停止取决于对端。
 
-端口架构的直接收益是：core 测试不需要启动 HTTP server、真实 MCP 进程或写入用户 Session，就可以覆盖绝大多数 agent 循环行为。
+| 子代理机制 | 生命周期与边界 |
+| --- | --- |
+| `delegate_task` | 一次性委派、独立 Thread、只读禁 shell、随父 turn 取消；每父 turn 最多启动 4 次，单次超时 300 秒 |
+| 持久子代理 | Web 提供创建、续发、检查、等待、取消；跨父 turn 存活，每会话最多 8 个实例、4 个并发 run |
+
+持久子代理按 explore / plan / worker / reviewer 角色裁剪能力，有效权限不超过父权限和角色上限；写操作有共享写租约协调。`send_subagent` 只能在实例空闲时开始下一次执行，`wait_subagents` 超时不取消任务。重启将活跃任务标为 interrupted，不自动重放。
+
+子代理不提供 MCP 或递归委派；只读角色仍可使用获准的 `web_fetch`，不等于离线。项目 Hook 需显式信任；MCP 的只读声明属于对外部 server 的信任边界。
+
+## 5. 修改应该放在哪里
+
+| 修改内容 | 位置／阅读入口 |
+| --- | --- |
+| 消息、turn、事实与事件类型 | `crates/agent-protocol/src/` |
+| 模型／工具循环、审批恢复与调度 | `crates/agent-core/src/agent.rs`；端口见 `model.rs`、`tool.rs` |
+| 模型 HTTP 请求和 SSE 转换 | `crates/agent-model/src/` |
+| 内置工具、工具注册与 MCP | `crates/agent-tools/src/` |
+| 路径与权限决策 | `crates/agent-sandbox/src/` |
+| 上下文、持久化、子代理编排 | `crates/agent-runtime/src/turn.rs`、`session_handle.rs`、`subagent_supervisor.rs` |
+| 配置、入口与界面 | `agent-config`、`agent-cli`、`agent-server` |
+| Hook 策略扩展 | `crates/agent-hooks/src/` |
+| 核心行为回归 | `crates/agent-eval/src/suite.rs` |
+
+测试按边界分层：core/eval 使用假模型与工具验证循环；适配器测试协议转换；runtime 测试持久化与编排；server/Web 测试交互。确定性 eval 通过不代表真实模型任务成功率。
+
+## 6. 文档怎样维护
+
+- 改变已实现的模块边界、主流程或不变量时，更新本文。
+- 进度与验证结果只写入 [STATUS.md](STATUS.md)，不在这里堆待办。
+- 重要选择的背景、备选方案与代价记录为 [ADR](docs/adr/README.md)，不把历史设计补写成刚刚批准的决策。
