@@ -6,10 +6,18 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rust:
     name: Rust
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,7 +29,7 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test
         run: cargo test --workspace --locked
@@ -29,12 +37,13 @@ jobs:
       - name: Eval agent loop
         run: cargo run --locked -p agent-eval -- run
 
-      - name: Build
+      - name: Build binaries
         run: cargo build --workspace --locked
 
   web:
     name: Web dashboard
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
