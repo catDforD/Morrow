@@ -817,7 +817,7 @@ impl BuiltInTools {
         Ok(output)
     }
 
-    fn search_text_with_ripgrep(
+    pub(crate) fn search_text_with_ripgrep(
         &self,
         ripgrep: &Path,
         path: &Path,
@@ -846,7 +846,10 @@ impl BuiltInTools {
             command.arg("--glob").arg(format!("!**/{skipped}/**"));
             command.arg("--glob").arg(format!("!{skipped}/**"));
         }
+        // query 来自模型且不校验前导短横线，必须用 `--` 终止选项解析，
+        // 否则 `--pre=<cmd>` 之类的 query 会被 ripgrep 当作选项执行命令。
         command
+            .arg("--")
             .arg(options.query)
             .arg(search_path)
             .stdout(Stdio::piped())

@@ -676,6 +676,66 @@ fn fallback_search_applies_output_budget() {
     assert_eq!(output["results"][0]["text_truncated"], true);
 }
 
+/// 回归：`search_text` 的 query 直接来自模型，必须以 `--` 终止 ripgrep 的选项解析。
+/// 修复前 `--pre=<命令>` 这类 query 会被当作选项，让 ripgrep 对每个被搜索的文件执行该命令，
+/// 从而绕过 `ShellPolicy` 的审批门。
+///
+/// 这里用伪 ripgrep 记录 argv，而不是依赖真实 ripgrep：CI 不安装 ripgrep，
+/// 走 `execute()` 的端到端测试会退化为 `search_text_fallback`，那条路径没有此缺陷，测试会假通过。
+#[cfg(unix)]
+#[test]
+fn ripgrep_query_is_passed_after_option_terminator() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = unique_dir("search-ripgrep-argv");
+    let recorded = root.join("argv.txt");
+    let fake_ripgrep = root.join("fake-rg");
+    fs::write(
+        &fake_ripgrep,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit 0\n",
+            recorded.display()
+        ),
+    )
+    .expect("write fake ripgrep");
+    let mut permissions = fs::metadata(&fake_ripgrep)
+        .expect("fake ripgrep metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_ripgrep, permissions).expect("make fake ripgrep executable");
+
+    let tools = BuiltInTools {
+        evaluator: PermissionEvaluator::new(
+            &root,
+            PermissionProfile::for_mode(PermissionMode::ReadOnly),
+        )
+        .expect("permission evaluator"),
+        allowed: BuiltInToolAllowlist::all(),
+        writer_lease: None,
+    };
+    let options = SearchOptions {
+        query: "--pre=touch pwned",
+        case_sensitive: false,
+        max_results: 10,
+    };
+
+    tools
+        .search_text_with_ripgrep(&fake_ripgrep, &root, &options)
+        .expect("ripgrep search");
+
+    let argv = fs::read_to_string(&recorded).expect("recorded argv");
+    let argv = argv.lines().collect::<Vec<_>>();
+    let query_index = argv
+        .iter()
+        .position(|argument| *argument == "--pre=touch pwned")
+        .expect("query reaches ripgrep as an argument");
+    assert_eq!(
+        argv[query_index - 1],
+        "--",
+        "query must follow the `--` option terminator, or ripgrep parses it as an option"
+    );
+}
+
 #[test]
 fn edit_file_replaces_unique_match() {
     let root = unique_dir("edit-root");
