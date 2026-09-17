@@ -80,7 +80,7 @@ jobs:
       - name: Build
         run: cargo build --release --locked --bin morrow --target ${{ matrix.target }}
 
-      - name: Download ripgrep
+      - name: Download ripgrep (Unix)
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
@@ -89,7 +89,7 @@ jobs:
           curl -fsSL "https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}/${asset}" -o "dist/${asset}"
           tar -xzf "dist/${asset}" -C dist/rg --strip-components=1 "ripgrep-${RIPGREP_VERSION}-${{ matrix.ripgrep_target }}/rg"
 
-      - name: Download ripgrep
+      - name: Download ripgrep (Windows)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
