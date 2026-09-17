@@ -1524,7 +1524,7 @@ pub(crate) fn built_in_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File path relative to the workspace root."},
-                    "start_line": {"type": "integer", "minimum": 1, "description": format!("First line to return (1-based). Defaults to 1. Combine with max_lines to page through large files; the returned output reports the file's total line count.")},
+                    "start_line": {"type": "integer", "minimum": 1, "description": "First line to return (1-based). Defaults to 1. Combine with max_lines to page through large files; the returned output reports the file's total line count."},
                     "max_lines": {"type": "integer", "minimum": 1, "maximum": MAX_READ_LINES, "description": format!("Maximum number of lines to return (1..={MAX_READ_LINES}). Defaults to {DEFAULT_READ_LINES}.")}
                 },
                 "required": ["path"],
